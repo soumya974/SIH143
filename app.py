@@ -391,27 +391,6 @@ def circle_points(lat, lon, radius_km, count=160):
     return points_lat, points_lon
 
 
-def create_spill_probability_grid(center_lat, center_lon, radius_km=12, n=90):
-    """Visualization uncertainty field around the detected centroid — a display
-    aid only, not a substitute for the project's physical drift model."""
-    lat_scale = radius_km / 111.0
-    lon_scale = radius_km / (111.0 * math.cos(math.radians(center_lat)))
-
-    lat = np.linspace(center_lat - lat_scale, center_lat + lat_scale, n)
-    lon = np.linspace(center_lon - lon_scale, center_lon + lon_scale, n)
-    xx, yy = np.meshgrid(lon, lat)
-
-    dx = (xx - center_lon) / lon_scale
-    dy = (yy - center_lat) / lat_scale
-
-    plume = np.exp(-(((dx - 0.18 * dy) ** 2) / 0.85 + (dy ** 2) / 0.32))
-    lobe = 0.38 * np.exp(-(((dx + 0.35) ** 2) / 0.20 + ((dy - 0.15) ** 2) / 0.42))
-
-    probability = plume + lobe
-    probability = probability / max(float(probability.max()), 1e-12)
-    return lon, lat, probability
-
-
 def closest_approach(ais_df, mmsi, origin_lat, origin_lon):
     """Real observation (from the loaded AIS track) nearest the reconstructed origin."""
     vessel = ais_df[ais_df["MMSI"] == mmsi]
@@ -706,10 +685,6 @@ if not suspects.empty and "Min_Distance_km" in suspects.columns:
 
 future_lat, future_lon = future_point
 
-lon_grid, lat_grid, probability_grid = create_spill_probability_grid(
-    centroid[0], centroid[1], radius_km=max(10, search_radius * 2),
-)
-
 
 # ---------------------------------------------------------------------
 # TOP METRICS
@@ -736,68 +711,73 @@ st.markdown('<div class="section-title">SPATIO-TEMPORAL INVESTIGATION MAP</div>'
 
 fig = go.Figure()
 
+# Probability of origin, drawn as contour rings (like a forecast cone) instead
+# of a glowing heatmap — easier to read against a real coastline basemap.
 if show_probability:
-    fig.add_trace(go.Heatmap(
-        x=lon_grid, y=lat_grid, z=probability_grid,
-        zmin=0, zmax=1,
-        colorscale=[
-            [0.00, "rgba(4,12,18,0)"],
-            [0.25, "rgba(0,100,140,.20)"],
-            [0.55, "rgba(0,210,255,.38)"],
-            [0.80, "rgba(255,176,0,.55)"],
-            [1.00, "rgba(255,60,70,.82)"],
-        ],
-        hovertemplate="Probability: %{z:.0%}<extra></extra>",
-        showscale=True,
-        colorbar=dict(title="SPILL<br>PROBABILITY", thickness=10),
-        name="Spill probability",
-    ))
+    base_radius = max(10.0, search_radius * 2)
+    contour_rings = [
+        (1.00, "30% contour", "rgba(255,176,0,0.30)"),
+        (0.65, "60% contour", "rgba(255,176,0,0.55)"),
+        (0.35, "85% contour", "rgba(255,176,0,0.85)"),
+    ]
+    for fraction, label, color in contour_rings:
+        clat, clon = circle_points(centroid[0], centroid[1], base_radius * fraction)
+        fig.add_trace(go.Scattergeo(
+            lat=clat, lon=clon, mode="lines",
+            line=dict(width=1.5, color=color),
+            name=label, hovertemplate=f"Origin probability — {label}<extra></extra>",
+        ))
 
 if show_search_ring:
     clat, clon = circle_points(centroid[0], centroid[1], search_radius)
     fig.add_trace(go.Scattergeo(
-        lat=clat, lon=clon, mode="lines", line=dict(width=1.5, dash="dot"),
+        lat=clat, lon=clon, mode="lines",
+        line=dict(width=1.25, dash="dot", color="#9FB2BE"),
         name=f"{search_radius} km AIS zone", hoverinfo="skip",
     ))
 
 if show_uncertainty_ring:
     clat, clon = circle_points(centroid[0], centroid[1], 10)
     fig.add_trace(go.Scattergeo(
-        lat=clat, lon=clon, mode="lines", line=dict(width=1, dash="dash"),
+        lat=clat, lon=clon, mode="lines",
+        line=dict(width=1, dash="dash", color="#5C7A88"),
         name="10 km uncertainty", hoverinfo="skip",
     ))
 
 if hindcast_path:
     fig.add_trace(go.Scattergeo(
         lat=[p[0] for p in hindcast_path], lon=[p[1] for p in hindcast_path],
-        mode="lines", line=dict(width=4, dash="dot"),
+        mode="lines", line=dict(width=4, dash="dot", color="#FF4D5A"),
         name="Hindcast / probable source", hovertemplate="Hindcast path<extra></extra>",
     ))
 
 if forecast_path:
     fig.add_trace(go.Scattergeo(
         lat=[p[0] for p in forecast_path], lon=[p[1] for p in forecast_path],
-        mode="lines", line=dict(width=4),
+        mode="lines", line=dict(width=4, color="#45D6FF"),
         name="Future oil drift", hovertemplate="Projected drift<extra></extra>",
     ))
 
 fig.add_trace(go.Scattergeo(
     lat=[centroid[0]], lon=[centroid[1]], mode="markers+text",
-    marker=dict(size=15, symbol="star"), text=["OBSERVED SLICK"], textposition="top center",
+    marker=dict(size=15, symbol="star", color="#FFB000", line=dict(width=1, color="#071018")),
+    text=["OBSERVED SLICK"], textposition="top center", textfont=dict(color="#DCE8EE", size=10),
     name="Observed slick",
     hovertemplate="Observed slick<br>Lat: %{lat:.5f}<br>Lon: %{lon:.5f}<extra></extra>",
 ))
 
 fig.add_trace(go.Scattergeo(
     lat=[origin_point[0]], lon=[origin_point[1]], mode="markers+text",
-    marker=dict(size=12, symbol="circle"), text=["HINDCAST ORIGIN"], textposition="bottom center",
+    marker=dict(size=12, symbol="circle", color="#FF4D5A", line=dict(width=1, color="#071018")),
+    text=["HINDCAST ORIGIN"], textposition="bottom center", textfont=dict(color="#DCE8EE", size=10),
     name="Hindcast origin",
     hovertemplate="Hindcast origin<br>Lat: %{lat:.5f}<br>Lon: %{lon:.5f}<extra></extra>",
 ))
 
 fig.add_trace(go.Scattergeo(
     lat=[future_lat], lon=[future_lon], mode="markers+text",
-    marker=dict(size=10, symbol="diamond"), text=["FORECAST"], textposition="top center",
+    marker=dict(size=10, symbol="diamond", color="#45D6FF", line=dict(width=1, color="#071018")),
+    text=["FORECAST"], textposition="top center", textfont=dict(color="#DCE8EE", size=10),
     name="Forecast position", hovertemplate="Forecast position<extra></extra>",
 ))
 
@@ -809,9 +789,13 @@ if show_tracks:
 
         fig.add_trace(go.Scattergeo(
             lat=vessel["LAT"], lon=vessel["LON"], mode="lines",
-            line=dict(width=3 if is_top else 1, dash="solid" if is_top else "dot"),
-            opacity=0.95 if is_top else 0.42,
-            name=f"★ {name}" if is_top else name,
+            line=dict(
+                width=3 if is_top else 1,
+                dash="solid" if is_top else "dot",
+                color="#FFB000" if is_top else "#6B7F87",
+            ),
+            opacity=0.95 if is_top else 0.5,
+            name=f"Suspect vessel — {name}" if is_top else f"{name} (other vessel)",
             hovertemplate=f"{name}<br>MMSI: {mmsi}<br>Lat: %{{lat:.4f}}<br>Lon: %{{lon:.4f}}<extra></extra>",
             showlegend=is_top,
         ))
@@ -824,9 +808,10 @@ if not suspects.empty and "Min_Distance_km" in suspects.columns:
         if approach is None:
             continue
         c_lat, c_lon, c_dist = approach
+        is_top = suspect_mmsi is not None and int(row["MMSI"]) == int(suspect_mmsi)
         fig.add_trace(go.Scattergeo(
             lat=[c_lat], lon=[c_lon], mode="markers",
-            marker=dict(size=9, symbol="circle"),
+            marker=dict(size=8, symbol="circle", color="#FFB000" if is_top else "#9FB2BE"),
             name=f"{row['VesselName']} closest point",
             hovertemplate=(
                 f"<b>{row['VesselName']}</b><br>"
@@ -838,8 +823,8 @@ if not suspects.empty and "Min_Distance_km" in suspects.columns:
 
 fig.update_geos(
     projection_type="equirectangular",
-    showcountries=True, showcoastlines=True, coastlinecolor="#3B5664",
-    landcolor="#0B151C", oceancolor="#06131C", showland=True, showocean=True,
+    showcountries=True, showcoastlines=True, coastlinecolor="#5C7A88",
+    landcolor="#1F3327", oceancolor="#06131C", showland=True, showocean=True,
     bgcolor="#071018",
     lonaxis=dict(showgrid=True, gridcolor="#17303B"),
     lataxis=dict(showgrid=True, gridcolor="#17303B"),
@@ -859,6 +844,11 @@ fig.update_layout(
 )
 
 st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True})
+st.caption(
+    "Coastline, water and land shading follow standard nautical-chart conventions. "
+    "Probability rings show where the reconstructed origin is most likely to sit, "
+    "not a literal slick footprint."
+)
 
 
 # ---------------------------------------------------------------------
@@ -924,7 +914,26 @@ with middle:
             "Speed_at_CPA": "SPEED kt", "Risk_Score": "RISK SCORE",
         })
         format_dict = {c: "{:.2f}" for c in display.columns if c not in {"VESSEL", "TYPE"}}
-        st.dataframe(display.style.format(format_dict), use_container_width=True, hide_index=True, height=260)
+        st.dataframe(display.style.format(format_dict), use_container_width=True, hide_index=True, height=220)
+
+        ranked = suspects.sort_values("Risk_Score", ascending=True).tail(8)
+        bar_colors = [
+            "#FFB000" if suspect_mmsi is not None and int(m) == int(suspect_mmsi) else "#3B5664"
+            for m in ranked["MMSI"]
+        ]
+        risk_fig = go.Figure(go.Bar(
+            x=ranked["Risk_Score"], y=ranked["VesselName"], orientation="h",
+            marker=dict(color=bar_colors),
+            hovertemplate="%{y}<br>Risk score: %{x:.1f}<extra></extra>",
+        ))
+        risk_fig.update_layout(
+            height=220, margin=dict(l=10, r=10, t=10, b=10),
+            paper_bgcolor="#071018", plot_bgcolor="#071018",
+            font=dict(color="#DCE8EE", size=11),
+            xaxis=dict(title="Risk score", gridcolor="#17303B", zerolinecolor="#17303B"),
+            yaxis=dict(gridcolor="#17303B"),
+        )
+        st.plotly_chart(risk_fig, use_container_width=True)
 
 with right:
     st.markdown('<div class="section-title">TOP VESSEL PROFILE</div>', unsafe_allow_html=True)
@@ -945,13 +954,35 @@ with right:
                 <div class="metric-value">{top_suspect['Min_Distance_km']:.2f} km</div>
                 <div class="metric-note">closest AIS observation to hindcast origin</div>
             </div>
-            <br>
-            <div class="metric-card">
-                <div class="metric-label">RISK SCORE</div>
-                <div class="metric-value">{top_suspect['Risk_Score']:.1f}</div>
-                <div class="metric-note">ranking score from attribution module</div>
-            </div>
             """,
+            unsafe_allow_html=True,
+        )
+
+        gauge_max = max(100.0, float(top_suspect["Risk_Score"]) * 1.2)
+        gauge_fig = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=float(top_suspect["Risk_Score"]),
+            number=dict(font=dict(color="#DCE8EE", size=26)),
+            gauge=dict(
+                axis=dict(range=[0, gauge_max], tickcolor="#8299A6", tickfont=dict(color="#8299A6", size=9)),
+                bar=dict(color="#FFB000"),
+                bgcolor="#0A1720",
+                borderwidth=1, bordercolor="#263C49",
+                steps=[
+                    dict(range=[0, gauge_max * 0.4], color="#101E27"),
+                    dict(range=[gauge_max * 0.4, gauge_max * 0.7], color="#152530"),
+                    dict(range=[gauge_max * 0.7, gauge_max], color="#1B2E3A"),
+                ],
+            ),
+        ))
+        gauge_fig.update_layout(
+            height=170, margin=dict(l=20, r=20, t=10, b=10),
+            paper_bgcolor="#071018", font=dict(color="#DCE8EE"),
+        )
+        st.markdown('<div class="metric-label">RISK SCORE</div>', unsafe_allow_html=True)
+        st.plotly_chart(gauge_fig, use_container_width=True)
+        st.markdown(
+            '<div class="metric-note" style="margin-top:-8px">ranking score from attribution module</div>',
             unsafe_allow_html=True,
         )
 
@@ -1116,5 +1147,26 @@ vessel_summary = (
     .reset_index()
 )
 
-st.dataframe(vessel_summary.style.format({"AvgSpeed": "{:.1f} kt"}), use_container_width=True, hide_index=True)
+fleet_table_col, fleet_chart_col = st.columns([1.6, 1.0])
+
+with fleet_table_col:
+    st.dataframe(vessel_summary.style.format({"AvgSpeed": "{:.1f} kt"}), use_container_width=True, hide_index=True)
+
+with fleet_chart_col:
+    type_counts = vessel_summary["Type"].value_counts().reset_index()
+    type_counts.columns = ["Type", "Count"]
+    fleet_fig = go.Figure(go.Pie(
+        labels=type_counts["Type"], values=type_counts["Count"],
+        hole=0.55,
+        marker=dict(colors=["#45D6FF", "#FFB000", "#6B7F87", "#FF4D5A", "#36D399"]),
+        textfont=dict(color="#071018", size=11),
+        hovertemplate="%{label}<br>%{value} vessel(s)<extra></extra>",
+    ))
+    fleet_fig.update_layout(
+        height=240, margin=dict(l=10, r=10, t=10, b=10),
+        paper_bgcolor="#071018", font=dict(color="#DCE8EE", size=11),
+        showlegend=True, legend=dict(orientation="h", yanchor="bottom", y=-0.25),
+        annotations=[dict(text="Fleet mix", showarrow=False, font=dict(color="#8299A6", size=11))],
+    )
+    st.plotly_chart(fleet_fig, use_container_width=True)
 
