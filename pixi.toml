@@ -1,0 +1,29 @@
+[workspace]
+authors = ["Soumya Das <soumyadasjr@gmail.com>"]
+channels = ["conda-forge"]
+name = "sih143"
+platforms = ["win-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+python = ">=3.10,<3.12"
+streamlit = ">=1.30.0"
+folium = ">=0.15.1"
+streamlit-folium = ">=0.17.0"
+pandas = ">=2.1.0"
+geopandas = ">=0.14.3"
+numpy = ">=1.26.0,<2.0.0"
+opencv = ">=4.9.0"
+scikit-learn = ">=1.4.0"
+shapely = ">=2.0.0"
+geopy = ">=2.4.1"
+reportlab = ">=5.0.1,<6"
+eodag = ">=4.7.2,<5"
+rasterio = ">=1.4.4,<2"
+cryptography = ">=50.0.1,<51"
+plotly = ">=7.0.0,<8"
+
+[pypi-dependencies]
+tensorflow = ">=2.15.0"
