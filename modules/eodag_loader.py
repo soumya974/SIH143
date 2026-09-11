@@ -52,13 +52,24 @@ logger = logging.getLogger(__name__)
 # EODAG CLIENT (ROBUST INITIALIZATION)
 # ============================================================
 
-def create_eodag_client():
+def create_eodag_client(username=None, password=None):
     """
     Create an EODAG client safely, supporting both default environments
     and custom configuration files.
+
+    If username/password are provided, they are injected as EODAG's
+    documented environment-variable credential override
+    (EODAG__<PROVIDER>__AUTH__CREDENTIALS__USERNAME/PASSWORD) before the
+    gateway is constructed, so they take precedence over — or fill in for —
+    any missing entries in the on-disk eodag.yml config.
     """
     config_path = CONFIG["eodag"]["config_path"]
     provider = CONFIG["eodag"]["provider"]
+
+    if username:
+        os.environ[f"EODAG__{provider.upper()}__AUTH__CREDENTIALS__USERNAME"] = username
+    if password:
+        os.environ[f"EODAG__{provider.upper()}__AUTH__CREDENTIALS__PASSWORD"] = password
 
     if config_path.exists():
         logger.info("Loading EODAG configuration from: %s", config_path)
@@ -85,6 +96,7 @@ def search_sentinel1(
     max_lon,
     start_date,
     end_date,
+    items_per_page=1,
 ):
     collection = CONFIG["eodag"]["collection"]
     provider = CONFIG["eodag"]["provider"]
@@ -103,14 +115,19 @@ def search_sentinel1(
     logger.info("BBox: %.5f, %.5f -> %.5f, %.5f", min_lon, min_lat, max_lon, max_lat)
     logger.info("Start: %s | End: %s", start, end)
 
-    # Added items_per_page=1 to limit search results to 1 product
+    # items_per_page caps how many Sentinel-1 products EODAG returns for this
+    # search — configurable from the sidebar (EODAG retrieval settings),
+    # defaults to 1.
+    items_per_page = max(1, int(items_per_page))
+    logger.info("Items per page: %d", items_per_page)
+
     products = dag.search(
         collection=collection,
         geometry=geometry,
         start=start,
         end=end,
         provider=provider,
-        items_per_page=1,
+        items_per_page=items_per_page,
     )
 
     logger.info("Found %d Sentinel-1 products", len(products) if products else 0)
@@ -284,14 +301,22 @@ def create_metadata(min_lat, max_lat, min_lon, max_lon, start_date, end_date, pr
 # PIPELINE ENTRYPOINT
 # ============================================================
 
-def fetch_and_preprocess_sentinel(min_lat, max_lat, min_lon, max_lon, start_date, end_date):
+def fetch_and_preprocess_sentinel(min_lat, max_lat, min_lon, max_lon, start_date, end_date,
+                                   username=None, password=None, items_per_page=1):
+    """
+    username/password: optional Copernicus Dataspace credentials. If omitted,
+    EODAG falls back to whatever is already configured in eodag.yml or in the
+    process environment.
+    items_per_page: maximum number of Sentinel-1 products to request from
+    EODAG for this search. Defaults to 1.
+    """
     output_dir = CONFIG["output"]["directory"]
     output_dir.mkdir(parents=True, exist_ok=True)
 
     overview_path = output_dir / CONFIG["output"]["overview_image"]
     metadata_path = output_dir / CONFIG["output"]["metadata"]
 
-    dag = create_eodag_client()
+    dag = create_eodag_client(username=username, password=password)
 
     products = search_sentinel1(
         dag=dag,
@@ -301,6 +326,7 @@ def fetch_and_preprocess_sentinel(min_lat, max_lat, min_lon, max_lon, start_date
         max_lon=max_lon,
         start_date=start_date,
         end_date=end_date,
+        items_per_page=items_per_page,
     )
 
     if not products:

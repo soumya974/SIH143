@@ -4,8 +4,7 @@ OILTRACE — Maritime Spill Intelligence Dashboard
 SAR-based spill detection, Monte Carlo drift reconstruction and AIS vessel
 attribution. Spill imagery can come from a synthetic simulation or a real
 Sentinel-1 (EODAG) retrieval; AIS vessel traffic can come from a synthetic
-simulation or the real NOAA Marine Cadastre archive — chosen independently
-from the sidebar.
+simulation or a live real-time feed — chosen independently from the sidebar.
 
 Run:
     streamlit run app.py
@@ -13,31 +12,56 @@ Run:
 
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-import io
 import os
 import math
-import zipfile
+import json
+import asyncio
+import time
 
 import numpy as np
 import pandas as pd
-import requests
+import re
+import cv2
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+try:
+    import websockets
+except ImportError:
+    websockets = None
+
+try:
+    import folium
+    from folium.plugins import Draw
+    from streamlit_folium import st_folium
+except ImportError:
+    folium = None
+    Draw = None
+    st_folium = None
+
+try:
+    import credentials  # local, gitignored file — see credentials.py
+except ImportError:
+    credentials = None
+
+
+def _cred(attr_name, env_name):
+    """Looks up a credential from credentials.py first, then the environment."""
+    if credentials is not None:
+        value = getattr(credentials, attr_name, "")
+        if value:
+            return value
+    return os.environ.get(env_name, "")
+
+
 from modules.eodag_loader import fetch_and_preprocess_sentinel
-from modules.real_ais import fetch_marine_cadastre_data
 from modules.synthetic import generate_dynamic_dataset
 from modules.detection import detect_spill
 from modules.trajectory import simulate_drift, fetch_real_ocean_currents
 from modules.attribution import score_vessels
-
-from reportlab.lib.pagesizes import letter
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-)
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib import colors
+from modules.geo_screening import evaluate_natural_seeps, evaluate_offshore_platforms, assess_night_discharge
+from modules.yaml_report import generate_yaml_report
 
 
 # ---------------------------------------------------------------------
@@ -46,7 +70,7 @@ from reportlab.lib import colors
 
 st.set_page_config(
     page_title="OILTRACE — Maritime Spill Intelligence",
-    page_icon="🌊",
+    page_icon="OT",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -57,16 +81,31 @@ DATA_DIR.mkdir(exist_ok=True)
 AIS_FILE = DATA_DIR / "sample_ais.csv"
 SAR_FILE = DATA_DIR / "sample_sar.png"
 
-# Default test area — Gulf of Mexico, inside NOAA Marine Cadastre coverage.
+# Default test area — Gulf of Mexico.
 DEFAULT_MIN_LAT = 28.000
 DEFAULT_MAX_LAT = 29.500
 DEFAULT_MIN_LON = -94.000
 DEFAULT_MAX_LON = -92.000
 
+# Fixed min/max edge length (degrees) allowed for a box drawn on the map —
+# a drawn rectangle is clamped into this range on both axes before use.
+MIN_BBOX_SPAN_DEG = 0.2
+MAX_BBOX_SPAN_DEG = 6.0
+
+# Default EODAG search result limit (items_per_page) — how many Sentinel-1
+# products a satellite search will return.
+DEFAULT_EODAG_ITEMS_PER_PAGE = 1
+
 SPILL_SYNTHETIC = "Synthetic"
 SPILL_SATELLITE = "Satellite (Sentinel-1)"
 AIS_SYNTHETIC = "Synthetic"
-AIS_REAL = "Real (Marine Cadastre)"
+AIS_LIVE = "Live (Realtime AIS)"
+
+# Free real-time AIS feed (aisstream.io) — requires a free API key from
+# https://aisstream.io. All AIS/SAR outputs are written to ./data on
+# whatever machine runs this Streamlit app (your local system, or wherever
+# you deploy it) — nothing is uploaded elsewhere by this app.
+AISSTREAM_WS_URL = "wss://stream.aisstream.io/v0/stream"
 
 
 # ---------------------------------------------------------------------
@@ -225,6 +264,43 @@ st.markdown(
         font-size: 11px;
         margin: 2px 0 10px 0;
     }
+
+    /* Investigation-map tab bar — custom segmented-control look */
+    div[data-testid="stTabs"] [data-baseweb="tab-list"] {
+        gap: 6px;
+        background: #0A1720;
+        border: 1px solid #20313D;
+        border-radius: 12px;
+        padding: 5px;
+        width: fit-content;
+    }
+    div[data-testid="stTabs"] [data-baseweb="tab-border"] { display: none !important; }
+    div[data-testid="stTabs"] [data-baseweb="tab-highlight"] { display: none !important; }
+    div[data-testid="stTabs"] [data-baseweb="tab"] {
+        height: 38px;
+        padding: 0 20px;
+        background: transparent;
+        border: none;
+        border-radius: 8px;
+        color: #8299A6;
+        font-size: 13px;
+        font-weight: 650;
+        letter-spacing: .3px;
+        transition: all .15s ease;
+    }
+    div[data-testid="stTabs"] [data-baseweb="tab"]:hover {
+        background: #10222E;
+        color: #DCE8EE;
+    }
+    div[data-testid="stTabs"] [aria-selected="true"] {
+        background: #45D6FF !important;
+        color: #071018 !important;
+        font-weight: 750;
+    }
+    div[data-testid="stTabs"] [aria-selected="true"]:hover {
+        background: #45D6FF !important;
+        color: #071018 !important;
+    }
 </style>
 """,
     unsafe_allow_html=True,
@@ -264,71 +340,185 @@ def button_group(label, caption, options, key, icons=None):
 # DATA HELPERS — SYNTHETIC / REAL AIS
 # ---------------------------------------------------------------------
 
-def ensure_raw_ais_downloaded(target_date):
-    """Downloads and caches the NOAA Marine Cadastre daily AIS archive for
-    target_date, skipping the download if already cached for that date."""
-    os.makedirs("data", exist_ok=True)
-    raw_path = os.path.join("data", "raw_ais.csv")
-    marker_path = os.path.join("data", "raw_ais_date.txt")
-    date_str = target_date.strftime("%Y_%m_%d")
+def fetch_live_ais(api_key, min_lat, max_lat, min_lon, max_lon, duration_seconds=30):
+    """
+    Connects to the free aisstream.io real-time AIS websocket feed for
+    duration_seconds, collecting position/static reports inside the bounding
+    box, and writes them to data/sample_ais.csv on the local machine running
+    this app — the same file the synthetic AIS path uses.
 
-    if os.path.exists(raw_path) and os.path.exists(marker_path):
-        with open(marker_path, "r") as f:
-            if f.read().strip() == date_str:
-                return raw_path
+    Requires a free API key from https://aisstream.io (no cost, sign-up only)
+    and the 'websockets' package (pip install websockets).
+    """
+    if not api_key:
+        raise ValueError(
+            "A free aisstream.io API key is required for live AIS data. "
+            "Sign up at https://aisstream.io to get one, then paste it into the sidebar."
+        )
+    if websockets is None:
+        raise RuntimeError(
+            "The 'websockets' package is required for live AIS data. Install it with: pip install websockets"
+        )
 
-    url = f"https://coast.noaa.gov/htdata/CMSP/AISDataHandler/{target_date.year}/AIS_{date_str}.zip"
-    response = requests.get(url, stream=True, timeout=60)
-    response.raise_for_status()
+    records = {}
 
-    with zipfile.ZipFile(io.BytesIO(response.content)) as z:
-        csv_candidates = [f for f in z.namelist() if f.lower().endswith(".csv")]
-        if not csv_candidates:
-            raise FileNotFoundError("No CSV file found inside the NOAA AIS archive.")
-        with z.open(csv_candidates[0]) as f:
-            keep_cols = ["MMSI", "BaseDateTime", "LAT", "LON", "SOG", "VesselName", "VesselType"]
-            df = pd.read_csv(f)
-            rename_map = {
-                "Latitude": "LAT", "Longitude": "LON",
-                "Vessel_Name": "VesselName", "Vessel_Type": "VesselType",
-            }
-            df = df.rename(columns=rename_map)
-            df = df[[c for c in keep_cols if c in df.columns]]
+    async def _collect():
+        subscribe_message = {
+            "APIKey": api_key,
+            "BoundingBoxes": [[[min_lat, min_lon], [max_lat, max_lon]]],
+            "FilterMessageTypes": ["PositionReport", "ShipStaticData"],
+        }
 
-    df.to_csv(raw_path, index=False)
-    with open(marker_path, "w") as f:
-        f.write(date_str)
-    return raw_path
+        # aisstream.io requires deflate compression on the socket — omitting it
+        # is the usual cause of a connection that "just doesn't work".
+        async with websockets.connect(AISSTREAM_WS_URL, compression="deflate") as ws:
+            await ws.send(json.dumps(subscribe_message))
+
+            deadline = time.monotonic() + duration_seconds
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+
+                try:
+                    message = json.loads(raw)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+
+                # aisstream.io reports subscription problems (bad key, malformed
+                # bounding box, etc.) as a JSON error payload rather than closing
+                # the socket — surface it clearly instead of silently ignoring it.
+                error = message.get("error") or message.get("Error")
+                if error:
+                    raise RuntimeError(f"aisstream.io rejected the subscription: {error}")
+
+                meta = message.get("MetaData", {}) or {}
+                mmsi = meta.get("MMSI")
+                if mmsi is None:
+                    continue
+
+                entry = records.setdefault(mmsi, {
+                    "MMSI": mmsi,
+                    "BaseDateTime": meta.get("time_utc"),
+                    "LAT": meta.get("latitude"),
+                    "LON": meta.get("longitude"),
+                    "SOG": None,
+                    "VesselName": (meta.get("ShipName") or "").strip() or f"Vessel_{mmsi}",
+                    "VesselType": "Unknown",
+                })
+
+                msg_type = message.get("MessageType")
+                payload = (message.get("Message") or {}).get(msg_type, {})
+
+                if msg_type == "PositionReport":
+                    entry["LAT"] = payload.get("Latitude", entry["LAT"])
+                    entry["LON"] = payload.get("Longitude", entry["LON"])
+                    entry["SOG"] = payload.get("Sog", entry["SOG"])
+                    entry["BaseDateTime"] = meta.get("time_utc", entry["BaseDateTime"])
+                elif msg_type == "ShipStaticData":
+                    name = (payload.get("ShipName") or "").strip()
+                    if name:
+                        entry["VesselName"] = name
+                    if payload.get("Type") is not None:
+                        entry["VesselType"] = str(payload.get("Type"))
+
+    try:
+        asyncio.run(_collect())
+    except websockets.exceptions.ConnectionClosed as exc:
+        raise RuntimeError(
+            f"The aisstream.io connection closed unexpectedly ({exc}). "
+            "Double-check the API key, and that the bounding box isn't degenerate "
+            "(min/max lat and lon must differ)."
+        ) from exc
+    except (websockets.exceptions.InvalidHandshake, OSError) as exc:
+        raise RuntimeError(
+            f"Could not reach aisstream.io ({exc}). Check your internet connection "
+            "and that outbound access to wss://stream.aisstream.io is allowed."
+        ) from exc
+
+    rows = [r for r in records.values() if r["LAT"] is not None and r["LON"] is not None and r["SOG"] is not None]
+    if not rows:
+        raise RuntimeError(
+            "No live AIS position reports were received in that time window / bounding box. "
+            "Try a busier area or a longer capture duration."
+        )
+
+    df = pd.DataFrame(rows)
+    df.to_csv(AIS_FILE, index=False)
+    return str(AIS_FILE), len(df)
 
 
-def run_data_pipeline(spill_source, ais_source, min_lat, max_lat, min_lon, max_lon, start_date, end_date):
+def run_data_pipeline(spill_source, ais_source, min_lat, max_lat, min_lon, max_lon, start_date, end_date,
+                       eodag_username=None, eodag_password=None, eodag_items_per_page=DEFAULT_EODAG_ITEMS_PER_PAGE,
+                       aisstream_api_key=None, live_duration_seconds=30):
     """
     Populates data/sample_sar.png (+ spill_metadata.json) and data/sample_ais.csv
     according to the chosen sources, without letting one source's output clobber
     the other's. Returns (sar_file_path, ais_record_count).
     """
-    # Synthetic generation covers whichever side(s) requested it. Run first so a
-    # real satellite fetch / real AIS fetch below can overwrite only their own
-    # output file afterwards, without wiping out the other side's data.
     if spill_source == SPILL_SYNTHETIC or ais_source == AIS_SYNTHETIC:
         generate_dynamic_dataset(min_lat, max_lat, min_lon, max_lon, age_hours=12.0)
 
     if spill_source == SPILL_SATELLITE:
-        result = fetch_and_preprocess_sentinel(min_lat, max_lat, min_lon, max_lon, start_date, end_date)
+        result = fetch_and_preprocess_sentinel(
+            min_lat, max_lat, min_lon, max_lon, start_date, end_date,
+            username=eodag_username, password=eodag_password,
+            items_per_page=eodag_items_per_page,
+        )
         sar_file = str(result["overview"]) if isinstance(result, dict) and result.get("overview") else str(SAR_FILE)
     else:
         sar_file = str(SAR_FILE)
 
-    if ais_source == AIS_REAL:
-        ensure_raw_ais_downloaded(start_date)
-        _, ais_count = fetch_marine_cadastre_data(
-            min_lat, max_lat, min_lon, max_lon,
-            target_date=start_date.strftime("%Y_%m_%d"),
+    if ais_source == AIS_LIVE:
+        _, ais_count = fetch_live_ais(
+            aisstream_api_key, min_lat, max_lat, min_lon, max_lon,
+            duration_seconds=live_duration_seconds,
         )
     else:
         ais_count = len(pd.read_csv(AIS_FILE)) if AIS_FILE.exists() else 0
 
     return sar_file, ais_count
+
+
+GO_TIMESTAMP_RE = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})[ T](?P<time>\d{2}:\d{2}:\d{2})"
+    r"(?P<frac>\.\d+)?"
+    r"(?:\s*(?P<offset>[+-]\d{2}:?\d{2}))?"
+    r"(?:\s*[A-Za-z]{2,5})?\s*$"
+)
+
+
+def _normalize_go_timestamp(raw):
+    """
+    aisstream.io (written in Go) serializes timestamps using Go's
+    time.Time string format, e.g. '2026-09-10 11:02:31.555441947 +0000 UTC'
+    — nanosecond precision (Python's datetime only holds microseconds) plus a
+    trailing zone name ("UTC") that no strptime format recognizes. Rewrite
+    that into standard ISO-8601 microsecond precision so it parses cleanly;
+    strings that don't match this pattern are returned unchanged.
+    """
+    match = GO_TIMESTAMP_RE.match(raw.strip())
+    if not match:
+        return raw
+
+    date_part = match.group("date")
+    time_part = match.group("time")
+    frac = match.group("frac")
+    offset = match.group("offset") or "+00:00"
+
+    frac_part = ""
+    if frac:
+        digits = frac[1:][:6].ljust(6, "0")  # truncate/pad nanoseconds -> microseconds
+        frac_part = f".{digits}"
+
+    if ":" not in offset:
+        offset = f"{offset[:3]}:{offset[3:]}"
+
+    return f"{date_part}T{time_part}{frac_part}{offset}"
 
 
 def load_ais_data():
@@ -337,19 +527,57 @@ def load_ais_data():
         return pd.DataFrame()
 
     df = pd.read_csv(AIS_FILE)
+    raw_row_count = len(df)
 
     required = ["MMSI", "BaseDateTime", "LAT", "LON", "SOG", "VesselName", "VesselType"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError("AIS file is missing required columns: " + ", ".join(missing))
 
-    df["BaseDateTime"] = pd.to_datetime(df["BaseDateTime"], utc=True, errors="coerce")
+    raw_times = df["BaseDateTime"].astype(str).str.strip().map(_normalize_go_timestamp)
+    parsed = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns, UTC]")
+
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+    ):
+        still_missing = parsed.isna()
+        if not still_missing.any():
+            break
+        parsed.loc[still_missing] = pd.to_datetime(
+            raw_times[still_missing], format=fmt, utc=True, errors="coerce"
+        )
+
+    still_missing = parsed.isna()
+    if still_missing.any():
+        parsed.loc[still_missing] = pd.to_datetime(
+            raw_times[still_missing], utc=True, errors="coerce"
+        )
+
+    df["BaseDateTime"] = parsed
     df["LAT"] = pd.to_numeric(df["LAT"], errors="coerce")
     df["LON"] = pd.to_numeric(df["LON"], errors="coerce")
     df["SOG"] = pd.to_numeric(df["SOG"], errors="coerce")
-    df = df.dropna(subset=["MMSI", "BaseDateTime", "LAT", "LON", "SOG"]).copy()
-    df = df.sort_values(["MMSI", "BaseDateTime"])
-    return df
+
+    clean = df.dropna(subset=["MMSI", "BaseDateTime", "LAT", "LON", "SOG"]).copy()
+
+    if clean.empty and raw_row_count > 0:
+        bad_time = int(df["BaseDateTime"].isna().sum())
+        bad_lat = int(df["LAT"].isna().sum())
+        bad_lon = int(df["LON"].isna().sum())
+        bad_sog = int(df["SOG"].isna().sum())
+        sample = raw_times.iloc[0] if raw_row_count else "n/a"
+        raise ValueError(
+            f"{AIS_FILE} had {raw_row_count} row(s), but none survived cleaning "
+            f"(unparseable BaseDateTime: {bad_time}, LAT: {bad_lat}, LON: {bad_lon}, "
+            f"SOG: {bad_sog}). Example raw timestamp: '{sample}'."
+        )
+
+    clean = clean.sort_values(["MMSI", "BaseDateTime"])
+    return clean
 
 
 def validate_bbox(min_lat, max_lat, min_lon, max_lon):
@@ -361,6 +589,31 @@ def validate_bbox(min_lat, max_lat, min_lon, max_lon):
         raise ValueError("Latitude must be between -90 and 90 degrees.")
     if not (-180 <= min_lon <= 180 and -180 <= max_lon <= 180):
         raise ValueError("Longitude must be between -180 and 180 degrees.")
+
+
+def bbox_from_drawing(drawing):
+    """
+    Turns a single GeoJSON rectangle feature into a (min_lat, max_lat, min_lon, max_lon) bounding box.
+    """
+    coords = drawing["geometry"]["coordinates"][0]
+    lons = [pt[0] for pt in coords]
+    lats = [pt[1] for pt in coords]
+
+    south, north = min(lats), max(lats)
+    west, east = min(lons), max(lons)
+
+    lat_span = min(max(north - south, MIN_BBOX_SPAN_DEG), MAX_BBOX_SPAN_DEG)
+    lon_span = min(max(east - west, MIN_BBOX_SPAN_DEG), MAX_BBOX_SPAN_DEG)
+
+    center_lat = (north + south) / 2.0
+    center_lon = (east + west) / 2.0
+
+    min_lat = round(max(center_lat - lat_span / 2.0, -90.0), 3)
+    max_lat = round(min(center_lat + lat_span / 2.0, 90.0), 3)
+    min_lon = round(max(center_lon - lon_span / 2.0, -180.0), 3)
+    max_lon = round(min(center_lon + lon_span / 2.0, 180.0), 3)
+
+    return min_lat, max_lat, min_lon, max_lon
 
 
 # ---------------------------------------------------------------------
@@ -402,104 +655,40 @@ def closest_approach(ais_df, mmsi, origin_lat, origin_lon):
     return float(row["LAT"]), float(row["LON"]), float(dists[idx])
 
 
-# ---------------------------------------------------------------------
-# PDF REPORT
-# ---------------------------------------------------------------------
+def evidence_strength(top_suspect, candidate_count):
+    risk = float(top_suspect["Risk_Score"])
+    dist = float(top_suspect["Min_Distance_km"])
 
-def generate_pdf_report(spill_data, origin_point, spill_time, future_point, future_time,
-                         current_speed, current_dir, suspects, min_lat, max_lat, min_lon, max_lon,
-                         forecast_hours, spill_source, ais_source):
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
-    story = []
-    styles = getSampleStyleSheet()
-
-    title_style = ParagraphStyle("TitleStyle", parent=styles["Heading1"], fontSize=16,
-                                  textColor=colors.HexColor("#111111"), spaceAfter=10)
-    h2_style = ParagraphStyle("H2Style", parent=styles["Heading2"], fontSize=12,
-                               textColor=colors.HexColor("#333333"), spaceBefore=12, spaceAfter=6)
-    body_style = ParagraphStyle("BodyStyle", parent=styles["Normal"], fontSize=9,
-                                 textColor=colors.HexColor("#444444"), leading=12)
-
-    story.append(Paragraph("MARINE OIL SPILL INVESTIGATION AND ATTRIBUTION REPORT", title_style))
-    story.append(Paragraph(
-        f"<b>Generated Timestamp:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
-        body_style,
-    ))
-    story.append(Paragraph(
-        f"<b>Data Sources:</b> {spill_source} spill imagery, {ais_source} AIS tracking",
-        body_style,
-    ))
-    story.append(Spacer(1, 10))
-
-    story.append(Paragraph("1. Bounding Box and Slick Detection Metrics", h2_style))
-    det_data = [
-        ["Bounding Box Selected", f"Lat [{min_lat}, {max_lat}], Lon [{min_lon}, {max_lon}]"],
-        ["Observed Centroid", f"{spill_data['centroid'][0]:.4f}°N, {spill_data['centroid'][1]:.4f}°E"],
-        ["Surface Area", f"{spill_data['area_sqkm']:.2f} km² ({spill_data['area_sqm']:,.0f} m²)"],
-        ["Estimated Thickness", f"{spill_data['depth_mm']:.3f} mm ({spill_data['depth_um']:.1f} µm)"],
-        ["Discharge Volume", f"{spill_data['volume_m3']:,.1f} m³ ({spill_data['volume_barrels']:,.0f} Barrels)"],
-        ["Estimated Spill Age", f"{spill_data['estimated_age_hours']:.1f} Hours"],
-    ]
-    t1 = Table(det_data, colWidths=[180, 360])
-    t1.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f5f5f5")),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cccccc")),
-        ("PADDING", (0, 0), (-1, -1), 5),
-        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
-    ]))
-    story.append(t1)
-    story.append(Spacer(1, 10))
-
-    story.append(Paragraph("2. Metocean Physics and Hydrodynamic Drift", h2_style))
-    met_data = [
-        ["Live Ocean Current Vector", f"{current_speed:.2f} m/s at {current_dir:.0f}° True"],
-        ["Hindcasted Origin (PAST)", f"{origin_point[0]:.4f}°N, {origin_point[1]:.4f}°E"],
-        ["Estimated Release Window", spill_time.strftime("%Y-%m-%d %H:%M UTC")],
-        ["Forecast Position (FUTURE)", f"{future_point[0]:.4f}°N, {future_point[1]:.4f}°E (+{forecast_hours}h)"],
-        ["Forecast Target Time", future_time.strftime("%Y-%m-%d %H:%M UTC")],
-    ]
-    t2 = Table(met_data, colWidths=[180, 360])
-    t2.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f5f5f5")),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cccccc")),
-        ("PADDING", (0, 0), (-1, -1), 5),
-        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
-    ]))
-    story.append(t2)
-    story.append(Spacer(1, 10))
-
-    story.append(Paragraph("3. Top Suspect Vessel Attribution Ranking", h2_style))
-    if suspects.empty:
-        story.append(Paragraph("No AIS vessels were available for attribution.", body_style))
+    if risk >= 70 and dist <= 5:
+        return "HIGH", "danger"
+    elif risk >= 40 or dist <= 10:
+        return "MODERATE", ""
     else:
-        report_df = suspects.head(10).copy()
-        suspect_table_data = [list(report_df.columns)] + report_df.astype(str).values.tolist()
-        col_count = len(suspect_table_data[0])
-        width = 540 / max(col_count, 1)
-        t3 = Table(suspect_table_data, colWidths=[width] * col_count, repeatRows=1)
-        t3.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#333333")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cccccc")),
-            ("PADDING", (0, 0), (-1, -1), 4),
-            ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
-            ("FONTSIZE", (0, 0), (-1, -1), 7),
-        ]))
-        story.append(t3)
+        return "LOW", "good"
 
-    story.append(Spacer(1, 12))
-    story.append(Paragraph(
-        "Attribution scores are investigative prioritisation signals and must not "
-        "be interpreted as proof of legal responsibility.",
-        body_style,
-    ))
 
-    doc.build(story)
-    buffer.seek(0)
-    return buffer.getvalue()
+def compute_geo_range(lats, lons, min_span_deg=1.0, max_span_deg=10.0, pad_frac=0.2):
+    lat_arr = np.array(lats, dtype=float)
+    lon_arr = np.array(lons, dtype=float)
+    lat_arr = lat_arr[~np.isnan(lat_arr)]
+    lon_arr = lon_arr[~np.isnan(lon_arr)]
+
+    lat_min, lat_max = float(lat_arr.min()), float(lat_arr.max())
+    lon_min, lon_max = float(lon_arr.min()), float(lon_arr.max())
+
+    lat_center = (lat_min + lat_max) / 2
+    lon_center = (lon_min + lon_max) / 2
+
+    lat_span = max(lat_max - lat_min, 0.01) * (1 + pad_frac)
+    lon_span = max(lon_max - lon_min, 0.01) * (1 + pad_frac)
+
+    lat_span = min(max(lat_span, min_span_deg), max_span_deg)
+    lon_span = min(max(lon_span, min_span_deg), max_span_deg)
+
+    return (
+        [lat_center - lat_span / 2, lat_center + lat_span / 2],
+        [lon_center - lon_span / 2, lon_center + lon_span / 2],
+    )
 
 
 # ---------------------------------------------------------------------
@@ -541,13 +730,90 @@ with st.sidebar:
     st.markdown("### PIPELINE CONTROLS")
 
     st.markdown("**1 · Incident geometry**")
+
+    # Apply staged bounding box values if updated by the map drawing picker
+    if "pending_bbox" in st.session_state:
+        for k, v in st.session_state.pop("pending_bbox").items():
+            st.session_state[k] = v
+
+    for _key, _default in (
+        ("min_lat", DEFAULT_MIN_LAT), ("max_lat", DEFAULT_MAX_LAT),
+        ("min_lon", DEFAULT_MIN_LON), ("max_lon", DEFAULT_MAX_LON),
+    ):
+        if _key not in st.session_state:
+            st.session_state[_key] = _default
+
     c1, c2 = st.columns(2)
-    min_lat = c1.number_input("Min Lat (°)", value=DEFAULT_MIN_LAT, step=0.1, format="%.3f")
-    max_lat = c2.number_input("Max Lat (°)", value=DEFAULT_MAX_LAT, step=0.1, format="%.3f")
+    min_lat = c1.number_input("Min Lat (°)", value=float(st.session_state["min_lat"]), step=0.1, format="%.3f", key="input_min_lat")
+    max_lat = c2.number_input("Max Lat (°)", value=float(st.session_state["max_lat"]), step=0.1, format="%.3f", key="input_max_lat")
     c3, c4 = st.columns(2)
-    min_lon = c3.number_input("Min Lon (°)", value=DEFAULT_MIN_LON, step=0.1, format="%.3f")
-    max_lon = c4.number_input("Max Lon (°)", value=DEFAULT_MAX_LON, step=0.1, format="%.3f")
-    st.caption("Marine Cadastre AIS coverage is limited to US maritime waters.")
+    min_lon = c3.number_input("Min Lon (°)", value=float(st.session_state["min_lon"]), step=0.1, format="%.3f", key="input_min_lon")
+    max_lon = c4.number_input("Max Lon (°)", value=float(st.session_state["max_lon"]), step=0.1, format="%.3f", key="input_max_lon")
+
+    st.session_state.min_lat = min_lat
+    st.session_state.max_lat = max_lat
+    st.session_state.min_lon = min_lon
+    st.session_state.max_lon = max_lon
+
+    map_picker_available = folium is not None and st_folium is not None
+
+    if st.button("Draw bounding box on map", use_container_width=True, disabled=not map_picker_available):
+        st.session_state.show_map_picker = not st.session_state.get("show_map_picker", False)
+
+    if not map_picker_available:
+        st.caption("Install `folium` and `streamlit-folium` to draw the box on a map: `pip install folium streamlit-folium`.")
+
+    if st.session_state.get("show_map_picker") and map_picker_available:
+        st.caption(
+            f"Draw a rectangle on the map. The box is clamped between "
+            f"{MIN_BBOX_SPAN_DEG:.1f}° and {MAX_BBOX_SPAN_DEG:.1f}° on each side."
+        )
+        _center_lat = (st.session_state.min_lat + st.session_state.max_lat) / 2.0
+        _center_lon = (st.session_state.min_lon + st.session_state.max_lon) / 2.0
+
+        draw_map = folium.Map(
+            location=[_center_lat, _center_lon], zoom_start=6, tiles="cartodbdark_matter",
+        )
+        Draw(
+            export=False,
+            draw_options={
+                "rectangle": True,
+                "polyline": False,
+                "polygon": False,
+                "circle": False,
+                "circlemarker": False,
+                "marker": False,
+            },
+            edit_options={"edit": True, "remove": True},
+        ).add_to(draw_map)
+
+        map_state = st_folium(
+            draw_map, height=380, use_container_width=True, key="bbox_draw_map",
+            returned_objects=["last_active_drawing"],
+        )
+
+        drawing = map_state.get("last_active_drawing") if map_state else None
+        if drawing:
+            _new_min_lat, _new_max_lat, _new_min_lon, _new_max_lon = bbox_from_drawing(drawing)
+            st.caption(
+                f"Selected box: {_new_min_lat:.3f}° to {_new_max_lat:.3f}° lat, "
+                f"{_new_min_lon:.3f}° to {_new_max_lon:.3f}° lon."
+            )
+            if st.button("Use this box", type="primary", use_container_width=True, key="use_drawn_box"):
+                st.session_state["pending_bbox"] = {
+                    "min_lat": _new_min_lat,
+                    "max_lat": _new_max_lat,
+                    "min_lon": _new_min_lon,
+                    "max_lon": _new_max_lon,
+                    "input_min_lat": _new_min_lat,
+                    "input_max_lat": _new_max_lat,
+                    "input_min_lon": _new_min_lon,
+                    "input_max_lon": _new_max_lon,
+                }
+                st.session_state.show_map_picker = False
+                st.rerun()
+        else:
+            st.caption("No rectangle drawn yet.")
 
     st.divider()
     st.markdown("**2 · Data sources**")
@@ -556,20 +822,50 @@ with st.sidebar:
     spill_source = button_group(
         "Spill imagery", None,
         [SPILL_SYNTHETIC, SPILL_SATELLITE],
-        key="spill_source", icons=["🧪", "🛰️"],
+        key="spill_source",
     )
+
+    eodag_username, eodag_password = None, None
+    eodag_items_per_page = DEFAULT_EODAG_ITEMS_PER_PAGE
+    if spill_source == SPILL_SATELLITE:
+        eodag_username = _cred("COP_DATASPACE_USERNAME", "COP_DATASPACE_USERNAME") or None
+        eodag_password = _cred("COP_DATASPACE_PASSWORD", "COP_DATASPACE_PASSWORD") or None
+        with st.expander("EODAG retrieval settings", expanded=False):
+            st.caption(
+                "Copernicus Dataspace credentials are read automatically — from "
+                "credentials.py, then environment variables, then an existing "
+                "~/.config/eodag/eodag.yml on this machine."
+            )
+            eodag_items_per_page = st.number_input(
+                "Product search limit (items per page)", min_value=1, max_value=20,
+                value=DEFAULT_EODAG_ITEMS_PER_PAGE, step=1, key="eodag_items_per_page",
+                help="Maximum number of Sentinel-1 products EODAG returns for this search.",
+            )
+
     st.write("")
     ais_source = button_group(
         "AIS vessel tracking", None,
-        [AIS_SYNTHETIC, AIS_REAL],
-        key="ais_source", icons=["🧪", "🚢"],
+        [AIS_SYNTHETIC, AIS_LIVE],
+        key="ais_source",
     )
+
+    aisstream_api_key, live_duration_seconds = None, 30
+    if ais_source == AIS_LIVE:
+        aisstream_api_key = _cred("AISSTREAM_API_KEY", "AISSTREAM_API_KEY") or None
+        with st.expander("aisstream.io live feed settings", expanded=False):
+            st.caption("API key is read automatically from credentials.py or the AISSTREAM_API_KEY env var.")
+            live_duration_seconds = st.slider(
+                "Capture duration (seconds)", 10, 120, 30, key="live_duration_seconds",
+                help="How long to listen to the live feed before stopping and saving what was received.",
+            )
 
     st.divider()
     st.markdown("**3 · Analysis date range**")
+    today = datetime.now(timezone.utc).date()
     date_range = st.date_input(
-        "Sentinel-1 / AIS dates",
-        value=(datetime(2023, 1, 1).date(), datetime(2023, 1, 2).date()),
+        "Sentinel-1 search dates",
+        value=(today - timedelta(days=1), today),
+        max_value=today,
     )
     if isinstance(date_range, tuple) and len(date_range) == 2:
         start_date, end_date = date_range
@@ -586,6 +882,9 @@ with st.sidebar:
 
                 sar_file, ais_count = run_data_pipeline(
                     spill_source, ais_source, min_lat, max_lat, min_lon, max_lon, start_date, end_date,
+                    eodag_username=eodag_username, eodag_password=eodag_password,
+                    eodag_items_per_page=eodag_items_per_page,
+                    aisstream_api_key=aisstream_api_key, live_duration_seconds=live_duration_seconds,
                 )
 
                 ais_df = load_ais_data()
@@ -614,6 +913,11 @@ with st.sidebar:
     show_search_ring = st.checkbox("Show AIS investigation ring", True)
     show_uncertainty_ring = st.checkbox("Show uncertainty ring", True)
     search_radius = st.slider("AIS search radius (km)", 1, 20, 5)
+
+    st.caption("Map zoom range — how close/far the investigation map can start zoomed.")
+    zoom_min_deg, zoom_max_deg = st.slider(
+        "Map zoom range (°)", 0.5, 20.0, (1.0, 8.0), step=0.5,
+    )
 
     st.divider()
     if st.button("Run Full Analysis Pipeline", use_container_width=True, disabled=not st.session_state.data_ready):
@@ -665,6 +969,10 @@ if st.session_state.pipeline_run:
 
             top_suspect = suspects.iloc[0] if not suspects.empty else None
 
+            seep_eval = evaluate_natural_seeps(origin_point[0], origin_point[1], search_radius)
+            platform_eval = evaluate_offshore_platforms(origin_point[0], origin_point[1], search_radius)
+            night_check = assess_night_discharge(spill_time, origin_point[0], origin_point[1])
+
         except Exception as exc:
             st.error(f"Analysis failed: {exc}")
             st.stop()
@@ -691,7 +999,7 @@ future_lat, future_lon = future_point
 # ---------------------------------------------------------------------
 
 st.markdown('<div class="section-title">OIL SLICK PHYSICAL PROPERTIES</div>', unsafe_allow_html=True)
-st.markdown(f'<div class="src-caption">📡 Imagery: <b>{spill_source}</b> &nbsp;·&nbsp; 🚢 AIS: <b>{ais_source}</b></div>', unsafe_allow_html=True)
+st.markdown(f'<div class="src-caption">Imagery: <b>{spill_source}</b> &nbsp;·&nbsp; AIS: <b>{ais_source}</b></div>', unsafe_allow_html=True)
 
 k1, k2, k3, k4, k5 = st.columns(5)
 k1.metric("SURFACE AREA", f"{spill_data['area_sqkm']:.2f} km²", f"{spill_data['area_sqm']:,.0f} m²")
@@ -704,151 +1012,428 @@ st.divider()
 
 
 # ---------------------------------------------------------------------
-# MAIN MAP
+# SEPARATE SPATIO-TEMPORAL MAPS (detection / drift / attribution)
 # ---------------------------------------------------------------------
 
-st.markdown('<div class="section-title">SPATIO-TEMPORAL INVESTIGATION MAP</div>', unsafe_allow_html=True)
-
-fig = go.Figure()
-
-# Probability of origin, drawn as contour rings (like a forecast cone) instead
-# of a glowing heatmap — easier to read against a real coastline basemap.
-if show_probability:
-    base_radius = max(10.0, search_radius * 2)
-    contour_rings = [
-        (1.00, "30% contour", "rgba(255,176,0,0.30)"),
-        (0.65, "60% contour", "rgba(255,176,0,0.55)"),
-        (0.35, "85% contour", "rgba(255,176,0,0.85)"),
-    ]
-    for fraction, label, color in contour_rings:
-        clat, clon = circle_points(centroid[0], centroid[1], base_radius * fraction)
-        fig.add_trace(go.Scattergeo(
-            lat=clat, lon=clon, mode="lines",
-            line=dict(width=1.5, color=color),
-            name=label, hovertemplate=f"Origin probability — {label}<extra></extra>",
-        ))
-
-if show_search_ring:
-    clat, clon = circle_points(centroid[0], centroid[1], search_radius)
-    fig.add_trace(go.Scattergeo(
-        lat=clat, lon=clon, mode="lines",
-        line=dict(width=1.25, dash="dot", color="#9FB2BE"),
-        name=f"{search_radius} km AIS zone", hoverinfo="skip",
-    ))
-
-if show_uncertainty_ring:
-    clat, clon = circle_points(centroid[0], centroid[1], 10)
-    fig.add_trace(go.Scattergeo(
-        lat=clat, lon=clon, mode="lines",
-        line=dict(width=1, dash="dash", color="#5C7A88"),
-        name="10 km uncertainty", hoverinfo="skip",
-    ))
-
-if hindcast_path:
-    fig.add_trace(go.Scattergeo(
-        lat=[p[0] for p in hindcast_path], lon=[p[1] for p in hindcast_path],
-        mode="lines", line=dict(width=4, dash="dot", color="#FF4D5A"),
-        name="Hindcast / probable source", hovertemplate="Hindcast path<extra></extra>",
-    ))
-
-if forecast_path:
-    fig.add_trace(go.Scattergeo(
-        lat=[p[0] for p in forecast_path], lon=[p[1] for p in forecast_path],
-        mode="lines", line=dict(width=4, color="#45D6FF"),
-        name="Future oil drift", hovertemplate="Projected drift<extra></extra>",
-    ))
-
-fig.add_trace(go.Scattergeo(
-    lat=[centroid[0]], lon=[centroid[1]], mode="markers+text",
-    marker=dict(size=15, symbol="star", color="#FFB000", line=dict(width=1, color="#071018")),
-    text=["OBSERVED SLICK"], textposition="top center", textfont=dict(color="#DCE8EE", size=10),
-    name="Observed slick",
-    hovertemplate="Observed slick<br>Lat: %{lat:.5f}<br>Lon: %{lon:.5f}<extra></extra>",
-))
-
-fig.add_trace(go.Scattergeo(
-    lat=[origin_point[0]], lon=[origin_point[1]], mode="markers+text",
-    marker=dict(size=12, symbol="circle", color="#FF4D5A", line=dict(width=1, color="#071018")),
-    text=["HINDCAST ORIGIN"], textposition="bottom center", textfont=dict(color="#DCE8EE", size=10),
-    name="Hindcast origin",
-    hovertemplate="Hindcast origin<br>Lat: %{lat:.5f}<br>Lon: %{lon:.5f}<extra></extra>",
-))
-
-fig.add_trace(go.Scattergeo(
-    lat=[future_lat], lon=[future_lon], mode="markers+text",
-    marker=dict(size=10, symbol="diamond", color="#45D6FF", line=dict(width=1, color="#071018")),
-    text=["FORECAST"], textposition="top center", textfont=dict(color="#DCE8EE", size=10),
-    name="Forecast position", hovertemplate="Forecast position<extra></extra>",
-))
-
-if show_tracks:
-    for mmsi, vessel in ais.groupby("MMSI"):
-        vessel = vessel.sort_values("BaseDateTime")
-        name = str(vessel["VesselName"].iloc[0])
-        is_top = suspect_mmsi is not None and int(mmsi) == int(suspect_mmsi)
-
-        fig.add_trace(go.Scattergeo(
-            lat=vessel["LAT"], lon=vessel["LON"], mode="lines",
-            line=dict(
-                width=3 if is_top else 1,
-                dash="solid" if is_top else "dot",
-                color="#FFB000" if is_top else "#6B7F87",
-            ),
-            opacity=0.95 if is_top else 0.5,
-            name=f"Suspect vessel — {name}" if is_top else f"{name} (other vessel)",
-            hovertemplate=f"{name}<br>MMSI: {mmsi}<br>Lat: %{{lat:.4f}}<br>Lon: %{{lon:.4f}}<extra></extra>",
-            showlegend=is_top,
-        ))
-
-if not suspects.empty and "Min_Distance_km" in suspects.columns:
-    for _, row in suspects.iterrows():
-        if row["Min_Distance_km"] > search_radius:
-            continue
-        approach = closest_approach(ais, row["MMSI"], origin_point[0], origin_point[1])
-        if approach is None:
-            continue
-        c_lat, c_lon, c_dist = approach
-        is_top = suspect_mmsi is not None and int(row["MMSI"]) == int(suspect_mmsi)
-        fig.add_trace(go.Scattergeo(
-            lat=[c_lat], lon=[c_lon], mode="markers",
-            marker=dict(size=8, symbol="circle", color="#FFB000" if is_top else "#9FB2BE"),
-            name=f"{row['VesselName']} closest point",
-            hovertemplate=(
-                f"<b>{row['VesselName']}</b><br>"
-                f"Distance: {c_dist:.2f} km<br>"
-                f"Risk score: {row['Risk_Score']:.1f}<extra></extra>"
-            ),
-            showlegend=False,
-        ))
-
-fig.update_geos(
-    projection_type="equirectangular",
-    showcountries=True, showcoastlines=True, coastlinecolor="#5C7A88",
-    landcolor="#1F3327", oceancolor="#06131C", showland=True, showocean=True,
-    bgcolor="#071018",
-    lonaxis=dict(showgrid=True, gridcolor="#17303B"),
-    lataxis=dict(showgrid=True, gridcolor="#17303B"),
-    fitbounds="locations",
-)
-
-fig.update_layout(
-    height=610,
-    margin=dict(l=0, r=0, t=5, b=0),
-    paper_bgcolor="#071018",
-    plot_bgcolor="#071018",
-    font=dict(color="#DCE8EE", size=10),
-    legend=dict(
-        orientation="h", yanchor="bottom", y=0.01, xanchor="left", x=0.01,
-        bgcolor="rgba(5,12,17,.78)", bordercolor="#29404D", borderwidth=1,
-    ),
-)
-
-st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True})
+st.markdown('<div class="section-title">SPATIO-TEMPORAL INVESTIGATION MAPS</div>', unsafe_allow_html=True)
 st.caption(
-    "Coastline, water and land shading follow standard nautical-chart conventions. "
-    "Probability rings show where the reconstructed origin is most likely to sit, "
-    "not a literal slick footprint."
+    "Each evidence layer gets its own map detected slick geometry, drift/origin reconstruction, "
+    "and AIS vessel attribution instead of one overlapping map."
 )
+
+
+def _apply_geo_layout(fig, lat_range, lon_range, height=560):
+    fig.update_geos(
+        projection_type="equirectangular",
+        showcountries=True, showcoastlines=True, coastlinecolor="#4E7686",
+        landcolor="#16241C", oceancolor="#050F17", showland=True, showocean=True,
+        showlakes=True, lakecolor="#050F17",
+        bgcolor="#071018",
+        lonaxis=dict(showgrid=True, gridcolor="#152A34", gridwidth=0.6, range=lon_range),
+        lataxis=dict(showgrid=True, gridcolor="#152A34", gridwidth=0.6, range=lat_range),
+    )
+    fig.update_layout(
+        height=height, margin=dict(l=0, r=0, t=5, b=0),
+        paper_bgcolor="#071018", plot_bgcolor="#071018",
+        font=dict(color="#DCE8EE", size=10),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=0.01, xanchor="left", x=0.01,
+            bgcolor="rgba(5,12,17,.78)", bordercolor="#29404D", borderwidth=1,
+        ),
+    )
+
+
+def _hud_annotation(fig, title, lines, accent="#45D6FF"):
+    """Small translucent HUD-style info card pinned to the map's top-left corner."""
+    body = "<br>".join(lines)
+    fig.add_annotation(
+        xref="paper", yref="paper", x=0.012, y=0.98, xanchor="left", yanchor="top",
+        align="left", showarrow=False, bordercolor=accent, borderwidth=1, borderpad=8,
+        bgcolor="rgba(6,14,20,0.82)",
+        text=f"<b style='color:{accent}'>{title}</b><br>{body}",
+        font=dict(size=11, color="#DCE8EE"),
+    )
+
+
+polygon_pts = spill_data.get("polygon") or []
+polygon_lats = [p[0] for p in polygon_pts]
+polygon_lons = [p[1] for p in polygon_pts]
+detection_meta = spill_data.get("detection", {}) or {}
+
+tab_detection, tab_drift, tab_attribution = st.tabs([
+    "Detection Map", "Drift and Origin Map", "Vessel Attribution Map",
+])
+
+# --- TAB 1: DETECTION MAP -------
+with tab_detection:
+    fig_det = go.Figure()
+
+    if len(polygon_lats) >= 3:
+        ring_lat = polygon_lats + [polygon_lats[0]]
+        ring_lon = polygon_lons + [polygon_lons[0]]
+
+        # Soft outer glow pass, then a crisp inner boundary — reads much
+        # better against the dark basemap than a single flat line.
+        fig_det.add_trace(go.Scattergeo(
+            lat=ring_lat, lon=ring_lon, mode="lines",
+            line=dict(width=9, color="rgba(255,176,0,0.16)"),
+            hoverinfo="skip", showlegend=False,
+        ))
+        fig_det.add_trace(go.Scattergeo(
+            lat=ring_lat, lon=ring_lon, mode="lines",
+            line=dict(width=2.25, color="#FFC94D"),
+            fill="toself", fillcolor="rgba(255,176,0,0.22)",
+            name="Detected slick polygon",
+            hovertemplate="Detected slick boundary<extra></extra>",
+        ))
+    else:
+        st.warning("No detected polygon available for this run.")
+
+    concentration = spill_data.get("concentration_grid") or []
+    if concentration:
+        conc_lat = [p[0] for p in concentration]
+        conc_lon = [p[1] for p in concentration]
+        # Colour samples by distance from centroid so the interior texture
+        # of the slick reads visually instead of one flat dot colour.
+        conc_dist = [
+            haversine_km(la, lo, centroid[0], centroid[1]) for la, lo in zip(conc_lat, conc_lon)
+        ]
+        fig_det.add_trace(go.Scattergeo(
+            lat=conc_lat, lon=conc_lon, mode="markers",
+            marker=dict(
+                size=5, color=conc_dist, colorscale=[[0, "#FFF3D6"], [0.5, "#FFC94D"], [1, "#B9720C"]],
+                opacity=0.65, line=dict(width=0),
+                colorbar=dict(title="dist. from<br>centroid (km)", thickness=10, len=0.4, x=1.0, y=0.18),
+            ),
+            name="Detected dark-spot samples", hoverinfo="skip",
+        ))
+
+    # Layered "pulse" halo behind the centroid marker for visual weight.
+    for size, opacity in [(34, 0.10), (26, 0.16), (19, 0.22)]:
+        fig_det.add_trace(go.Scattergeo(
+            lat=[centroid[0]], lon=[centroid[1]], mode="markers",
+            marker=dict(size=size, symbol="star", color=f"rgba(255,176,0,{opacity})"),
+            hoverinfo="skip", showlegend=False,
+        ))
+    fig_det.add_trace(go.Scattergeo(
+        lat=[centroid[0]], lon=[centroid[1]], mode="markers+text",
+        marker=dict(size=13, symbol="star", color="#FFB000", line=dict(width=1.5, color="#071018")),
+        text=["SLICK CENTROID"], textposition="top center", textfont=dict(color="#FFE8B0", size=11),
+        name="Slick centroid",
+        hovertemplate=(
+            f"<b>Detection — {detection_meta.get('classification', 'n/a')}</b><br>"
+            f"Confidence score: {detection_meta.get('classification_score', 'n/a')}<br>"
+            f"Area: {spill_data['area_sqkm']:.2f} km²<br>"
+            f"Est. volume: {spill_data['volume_barrels']:,.0f} barrels<br>"
+            f"Est. age: {age_hours:.1f} h<br>"
+            "Lat: %{lat:.5f}<br>Lon: %{lon:.5f}<extra></extra>"
+        ),
+    ))
+
+    det_lats = polygon_lats + [centroid[0]]
+    det_lons = polygon_lons + [centroid[1]]
+    lat_range, lon_range = compute_geo_range(
+        det_lats, det_lons, min_span_deg=max(zoom_min_deg * 0.3, 0.2), max_span_deg=zoom_max_deg,
+    )
+    _apply_geo_layout(fig_det, lat_range, lon_range, height=600)
+
+    classification = detection_meta.get("classification", "n/a")
+    conf_score = detection_meta.get("classification_score", None)
+    accent_color = (
+        "#FF5964" if classification == "likely_lookalike"
+        else "#36D399" if classification == "probable_oil_slick"
+        else "#45D6FF"
+    )
+    _hud_annotation(
+        fig_det, "SAR DETECTION",
+        [
+            f"Classification: <b>{classification}</b>",
+            f"Confidence: <b>{conf_score if conf_score is not None else 'n/a'}</b>",
+            f"Area: <b>{spill_data['area_sqkm']:.2f} km²</b>",
+            f"Volume: <b>{spill_data['volume_barrels']:,.0f} bbl</b>",
+            f"Age: <b>{age_hours:.1f} h</b>",
+        ],
+        accent=accent_color,
+    )
+
+    st.plotly_chart(fig_det, use_container_width=True, config={"displayModeBar": True})
+
+    badge_class = (
+        "danger" if classification == "likely_lookalike"
+        else "good" if classification == "probable_oil_slick"
+        else ""
+    )
+    st.markdown(
+        f"""
+        <div class="alert {badge_class}">
+            <b>DETECTION EVIDENCE</b><br>
+            Method: <b>{detection_meta.get('method', 'n/a')}</b> ·
+            Classification: <b>{classification}</b> ·
+            Confidence score: <b>{detection_meta.get('classification_score', 'n/a')}</b><br>
+            Backscatter threshold: {detection_meta.get('backscatter_threshold', 'n/a')} ·
+            Polygon vertices: {len(polygon_pts)} ·
+            Area: {spill_data['area_sqkm']:.2f} km² ·
+            Est. volume: {spill_data['volume_barrels']:,.0f} barrels
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.expander("Classification descriptors (raw)"):
+        st.json(detection_meta.get("descriptors", {}))
+
+# --- TAB 2: DRIFT / ORIGIN RECONSTRUCTION MAP ------------------------------
+with tab_drift:
+    fig_drift = go.Figure()
+
+    if show_probability:
+        base_radius = max(10.0, search_radius * 2)
+        contour_rings = [
+            (1.00, "30% contour", "rgba(255,176,0,0.30)"),
+            (0.65, "60% contour", "rgba(255,176,0,0.55)"),
+            (0.35, "85% contour", "rgba(255,176,0,0.85)"),
+        ]
+        for fraction, label, color in contour_rings:
+            clat, clon = circle_points(origin_point[0], origin_point[1], base_radius * fraction)
+            fig_drift.add_trace(go.Scattergeo(
+                lat=clat, lon=clon, mode="lines", line=dict(width=1.5, color=color),
+                name=label, hovertemplate=f"Origin probability — {label}<extra></extra>",
+            ))
+
+    if show_uncertainty_ring:
+        clat, clon = circle_points(origin_point[0], origin_point[1], 10)
+        fig_drift.add_trace(go.Scattergeo(
+            lat=clat, lon=clon, mode="lines", line=dict(width=1, dash="dash", color="#5C7A88"),
+            name="10 km uncertainty", hoverinfo="skip",
+        ))
+
+    if hindcast_path:
+        fig_drift.add_trace(go.Scattergeo(
+            lat=[p[0] for p in hindcast_path], lon=[p[1] for p in hindcast_path],
+            mode="lines", line=dict(width=4, dash="dot", color="#FF4D5A"),
+            name="Hindcast / probable source", hovertemplate="Hindcast path<extra></extra>",
+        ))
+
+    if forecast_path:
+        fig_drift.add_trace(go.Scattergeo(
+            lat=[p[0] for p in forecast_path], lon=[p[1] for p in forecast_path],
+            mode="lines", line=dict(width=4, color="#45D6FF"),
+            name="Future oil drift", hovertemplate="Projected drift<extra></extra>",
+        ))
+
+    if len(polygon_lats) >= 3:
+        ring_lat = polygon_lats + [polygon_lats[0]]
+        ring_lon = polygon_lons + [polygon_lons[0]]
+        fig_drift.add_trace(go.Scattergeo(
+            lat=ring_lat, lon=ring_lon, mode="lines",
+            line=dict(width=1, color="rgba(255,176,0,0.6)"),
+            fill="toself", fillcolor="rgba(255,176,0,0.10)",
+            name="Detected slick (context)", hoverinfo="skip",
+        ))
+
+    fig_drift.add_trace(go.Scattergeo(
+        lat=[centroid[0]], lon=[centroid[1]], mode="markers+text",
+        marker=dict(size=13, symbol="star", color="#FFB000", line=dict(width=1.5, color="#071018")),
+        text=["① SAR DETECTION"], textposition="top center", textfont=dict(color="#FFE8B0", size=11),
+        name="1 · Observed slick",
+        hovertemplate=(
+            f"<b>Evidence 1 — SAR detection</b><br>Area: {spill_data['area_sqkm']:.2f} km²<br>"
+            "Lat: %{lat:.5f}<br>Lon: %{lon:.5f}<extra></extra>"
+        ),
+    ))
+    fig_drift.add_trace(go.Scattergeo(
+        lat=[origin_point[0]], lon=[origin_point[1]], mode="markers",
+        marker=dict(size=26, symbol="circle", color="rgba(255,77,90,0.22)"),
+        hoverinfo="skip", showlegend=False,
+    ))
+    fig_drift.add_trace(go.Scattergeo(
+        lat=[origin_point[0]], lon=[origin_point[1]], mode="markers+text",
+        marker=dict(size=13, symbol="circle", color="#FF4D5A", line=dict(width=1.5, color="#071018")),
+        text=["② HINDCAST ORIGIN"], textposition="bottom center", textfont=dict(color="#FFC2C7", size=11),
+        name="2 · Hindcast origin",
+        hovertemplate=(
+            f"<b>Evidence 2 — Reconstructed origin</b><br>"
+            f"Release window: {spill_time.strftime('%Y-%m-%d %H:%M UTC')}<br>"
+            f"Current used: {current_speed:.2f} m/s @ {current_dir:.0f}°<br>"
+            "Lat: %{lat:.5f}<br>Lon: %{lon:.5f}<extra></extra>"
+        ),
+    ))
+    fig_drift.add_trace(go.Scattergeo(
+        lat=[future_lat], lon=[future_lon], mode="markers+text",
+        marker=dict(size=11, symbol="diamond", color="#45D6FF", line=dict(width=1.5, color="#071018")),
+        text=["③ FORECAST"], textposition="top center", textfont=dict(color="#C4EEFF", size=11),
+        name="3 · Forecast position",
+        hovertemplate=(
+            f"<b>Projection — +{forecast_hours} h</b><br>"
+            f"Target time: {future_time.strftime('%Y-%m-%d %H:%M UTC')}<br>"
+            "Lat: %{lat:.5f}<br>Lon: %{lon:.5f}<extra></extra>"
+        ),
+    ))
+
+    drift_lats = [centroid[0], origin_point[0], future_lat] + [p[0] for p in hindcast_path] + [p[0] for p in forecast_path]
+    drift_lons = [centroid[1], origin_point[1], future_lon] + [p[1] for p in hindcast_path] + [p[1] for p in forecast_path]
+    lat_range, lon_range = compute_geo_range(
+        drift_lats, drift_lons, min_span_deg=zoom_min_deg, max_span_deg=zoom_max_deg,
+    )
+    _apply_geo_layout(fig_drift, lat_range, lon_range)
+    st.plotly_chart(fig_drift, use_container_width=True, config={"displayModeBar": True})
+
+    st.markdown(
+        f"""
+        <div class="alert">
+            <b>DRIFT EVIDENCE</b><br>
+            Ocean current: <b>{current_speed:.2f} m/s @ {current_dir:.0f}°</b> ·
+            Hindcast origin: <b>{origin_point[0]:.5f}, {origin_point[1]:.5f}</b> ·
+            Release window: {spill_time.strftime('%Y-%m-%d %H:%M UTC')}<br>
+            Forecast (+{forecast_hours} h): <b>{future_lat:.5f}, {future_lon:.5f}</b>
+            at {future_time.strftime('%Y-%m-%d %H:%M UTC')}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# --- TAB 3: VESSEL ATTRIBUTION MAP -----------------------------------------
+with tab_attribution:
+    fig_attr = go.Figure()
+
+    if show_search_ring:
+        clat, clon = circle_points(origin_point[0], origin_point[1], search_radius)
+        fig_attr.add_trace(go.Scattergeo(
+            lat=clat, lon=clon, mode="lines", line=dict(width=1.25, dash="dot", color="#9FB2BE"),
+            name=f"{search_radius} km AIS zone", hoverinfo="skip",
+        ))
+
+    fig_attr.add_trace(go.Scattergeo(
+        lat=[origin_point[0]], lon=[origin_point[1]], mode="markers",
+        marker=dict(size=12, symbol="circle", color="#FF4D5A", line=dict(width=1.5, color="#071018")),
+        name="Reconstructed origin",
+        hovertemplate="Reconstructed origin<br>Lat: %{lat:.5f}<br>Lon: %{lon:.5f}<extra></extra>",
+    ))
+
+    if show_tracks:
+        for mmsi, vessel in ais.groupby("MMSI"):
+            vessel = vessel.sort_values("BaseDateTime")
+            name = str(vessel["VesselName"].iloc[0])
+            is_top = suspect_mmsi is not None and int(mmsi) == int(suspect_mmsi)
+            fig_attr.add_trace(go.Scattergeo(
+                lat=vessel["LAT"], lon=vessel["LON"], mode="lines",
+                line=dict(
+                    width=3 if is_top else 1, dash="solid" if is_top else "dot",
+                    color="#FFB000" if is_top else "#6B7F87",
+                ),
+                opacity=0.95 if is_top else 0.5,
+                name=f"Suspect vessel — {name}" if is_top else f"{name} (other vessel)",
+                hovertemplate=f"{name}<br>MMSI: {mmsi}<br>Lat: %{{lat:.4f}}<br>Lon: %{{lon:.4f}}<extra></extra>",
+                showlegend=is_top,
+            ))
+
+    if not suspects.empty and "Min_Distance_km" in suspects.columns:
+        for _, row in suspects.iterrows():
+            if row["Min_Distance_km"] > search_radius:
+                continue
+            approach = closest_approach(ais, row["MMSI"], origin_point[0], origin_point[1])
+            if approach is None:
+                continue
+            c_lat, c_lon, c_dist = approach
+            is_top = suspect_mmsi is not None and int(row["MMSI"]) == int(suspect_mmsi)
+
+            if is_top:
+                fig_attr.add_trace(go.Scattergeo(
+                    lat=[c_lat], lon=[c_lon], mode="markers",
+                    marker=dict(size=24, symbol="circle", color="rgba(255,176,0,0.25)"),
+                    hoverinfo="skip", showlegend=False,
+                ))
+
+            fig_attr.add_trace(go.Scattergeo(
+                lat=[c_lat], lon=[c_lon], mode="markers+text" if is_top else "markers",
+                marker=dict(
+                    size=12 if is_top else 8, symbol="circle",
+                    color="#FFB000" if is_top else "#9FB2BE",
+                    line=dict(width=1.5, color="#071018") if is_top else None,
+                ),
+                text=["④ TOP SUSPECT"] if is_top else None,
+                textposition="bottom center", textfont=dict(color="#FFE8B0", size=11),
+                name=f"4 · {row['VesselName']} (closest approach)" if is_top else f"{row['VesselName']} closest point",
+                hovertemplate=(
+                    f"<b>{'Evidence 4 — ' if is_top else ''}{row['VesselName']}</b><br>"
+                    f"Distance to origin: {c_dist:.2f} km<br>"
+                    f"Time offset: {row['Time_Offset_hrs']:.1f} h<br>"
+                    f"Risk score: {row['Risk_Score']:.1f}<extra></extra>"
+                ),
+                showlegend=is_top,
+            ))
+
+    attr_lats = [origin_point[0]] + ais["LAT"].tolist()
+    attr_lons = [origin_point[1]] + ais["LON"].tolist()
+    lat_range, lon_range = compute_geo_range(
+        attr_lats, attr_lons, min_span_deg=zoom_min_deg, max_span_deg=zoom_max_deg,
+    )
+    _apply_geo_layout(fig_attr, lat_range, lon_range)
+    st.plotly_chart(fig_attr, use_container_width=True, config={"displayModeBar": True})
+
+    if top_suspect is not None:
+        st.markdown(
+            f"""
+            <div class="alert">
+                <b>VESSEL EVIDENCE — TOP SUSPECT</b><br>
+                <b>{top_suspect['VesselName']}</b> ({top_suspect['VesselType']}, MMSI {top_suspect['MMSI']}) ·
+                {top_suspect['Min_Distance_km']:.2f} km from origin ·
+                {top_suspect['Time_Offset_hrs']:.1f} h time offset ·
+                risk score {top_suspect['Risk_Score']:.1f}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        with st.expander("All evaluated vessels (evidence table)"):
+            st.dataframe(suspects, use_container_width=True, hide_index=True)
+    else:
+        st.info("No vessel could be linked to the reconstructed origin with the current AIS data and search radius.")
+
+
+# ---------------------------------------------------------------------
+# NATURAL SOURCE SCREENING — seeps / platforms / day-night check
+# ---------------------------------------------------------------------
+
+st.markdown('<div class="section-title">NATURAL SOURCE SCREENING</div>', unsafe_allow_html=True)
+st.caption(
+    "Before treating the top AIS lead as a vessel discharge, checks the reconstructed origin against "
+    "documented natural seeps and fixed offshore platforms, and flags whether the estimated release "
+    "time falls in nautical darkness."
+)
+
+badges = [
+    ("Natural seeps", seep_eval["label"], seep_eval["flag"]),
+    ("Offshore platforms", platform_eval["label"], platform_eval["flag"]),
+    ("Release timing", night_check["label"], night_check["flag"]),
+]
+pills_html = "".join(
+    f'<span class="pill{" " if False else ""}" style="{"border-color:#FFB000;color:#FFE6A3;background:#281D06;" if flg else ""}">'
+    f"<b>{title}:</b> {label}</span>"
+    for title, label, flg in badges
+)
+st.markdown(f'<div style="margin-bottom:10px;">{pills_html}</div>', unsafe_allow_html=True)
+
+if seep_eval["flag"] or platform_eval["flag"]:
+    st.markdown(
+        '<div class="alert danger"><b>POSSIBLE NATURAL / INFRASTRUCTURE SOURCE</b><br>'
+        'The reconstructed origin falls within the search radius of a documented seep or platform above. '
+        'Treat any AIS vessel lead with added caution until this is ruled out.</div>',
+        unsafe_allow_html=True,
+    )
+else:
+    st.markdown(
+        '<div class="alert good"><b>CLEARED FROM KNOWN NATURAL / FIXED SOURCES</b><br>'
+        'No documented natural seep or offshore platform lies within the current search radius of the '
+        'reconstructed origin.</div>',
+        unsafe_allow_html=True,
+    )
+
+with st.expander("Full natural seep / platform proximity tables"):
+    st.markdown("**Natural seeps evaluated**")
+    st.dataframe(seep_eval["table"], use_container_width=True, hide_index=True)
+    st.markdown("**Offshore platforms evaluated**")
+    st.dataframe(platform_eval["table"], use_container_width=True, hide_index=True)
+
+st.divider()
 
 
 # ---------------------------------------------------------------------
@@ -858,29 +1443,44 @@ st.caption(
 left, middle, right = st.columns([1.15, 1.7, 1.0])
 
 with left:
-    st.markdown('<div class="section-title">TEMPORAL RECONSTRUCTION</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">EVIDENCE LOG</div>', unsafe_allow_html=True)
     st.markdown(
         f"""
         <div class="timeline">
             <div class="timeline-row">
-                <span class="dot"></span>
-                <div><b>PAST</b><br>
-                <span class="small">Hindcast release window: {spill_time.strftime('%Y-%m-%d %H:%M UTC')}</span></div>
-            </div>
-            <div class="timeline-row">
-                <span class="dot"></span>
-                <div><b>ORIGIN</b><br>
-                <span class="small">{origin_point[0]:.5f}, {origin_point[1]:.5f}</span></div>
-            </div>
-            <div class="timeline-row">
                 <span class="dot-red"></span>
-                <div><b>T 0 · SAR OBSERVATION</b><br>
-                <span class="small">Detected slick centroid</span></div>
+                <div><b>1 · SAR OBSERVATION (T0)</b><br>
+                <span class="small">
+                    {spill_source} imagery detected a slick at {centroid[0]:.5f}, {centroid[1]:.5f}
+                    — {spill_data['area_sqkm']:.2f} km², est. {spill_data['volume_barrels']:,.0f} barrels,
+                    age ≈ {age_hours:.1f} h
+                </span></div>
             </div>
             <div class="timeline-row">
                 <span class="dot"></span>
-                <div><b>T + {forecast_hours} h</b><br>
-                <span class="small">Forecast: {future_time.strftime('%Y-%m-%d %H:%M UTC')}</span></div>
+                <div><b>2 · HINDCAST RELEASE WINDOW</b><br>
+                <span class="small">
+                    Backward drift modelling (current: {current_speed:.2f} m/s @ {current_dir:.0f}°) points to
+                    release around {spill_time.strftime('%Y-%m-%d %H:%M UTC')}
+                </span></div>
+            </div>
+            <div class="timeline-row">
+                <span class="dot"></span>
+                <div><b>3 · RECONSTRUCTED ORIGIN</b><br>
+                <span class="small">Probable source at {origin_point[0]:.5f}, {origin_point[1]:.5f}</span></div>
+            </div>
+            <div class="timeline-row">
+                <span class="dot"></span>
+                <div><b>4 · AIS CORRELATION</b><br>
+                <span class="small">
+                    {len(suspects)} vessel(s) evaluated via {ais_source} AIS,
+                    {candidate_count} within {search_radius} km of the origin
+                </span></div>
+            </div>
+            <div class="timeline-row">
+                <span class="dot"></span>
+                <div><b>5 · FORECAST (T+{forecast_hours} h)</b><br>
+                <span class="small">Projected position by {future_time.strftime('%Y-%m-%d %H:%M UTC')}</span></div>
             </div>
         </div>
         """,
@@ -890,14 +1490,22 @@ with left:
     st.markdown("<br>", unsafe_allow_html=True)
 
     if top_suspect is not None:
+        strength_label, strength_class = evidence_strength(top_suspect, candidate_count)
         st.markdown(
             f"""
-            <div class="alert danger">
-                <b>INVESTIGATION LEAD</b><br>
-                {top_suspect['VesselName']} has the strongest attribution signal
-                among the loaded AIS observations. This is a lead, not proof of responsibility.
+            <div class="alert {strength_class}">
+                <b>INVESTIGATION LEAD — {strength_label} CONFIDENCE</b><br>
+                <b>{top_suspect['VesselName']}</b> ({top_suspect['VesselType']}, MMSI {top_suspect['MMSI']})
+                — {top_suspect['Min_Distance_km']:.2f} km from reconstructed origin,
+                {top_suspect['Time_Offset_hrs']:.1f} h from estimated release, risk score {top_suspect['Risk_Score']:.1f}.
+                This is an investigative lead, not proof of responsibility.
             </div>
             """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<div class="alert">No vessel could be linked to the reconstructed origin with the current AIS data and search radius.</div>',
             unsafe_allow_html=True,
         )
 
@@ -1072,11 +1680,63 @@ with sar_col:
     st.markdown('<div class="section-title">SAR EVIDENCE</div>', unsafe_allow_html=True)
     sar_path = Path(st.session_state.sar_file)
 
-    if sar_path.exists():
-        if sar_path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
-            st.image(str(sar_path), caption=f"{spill_source} SAR output", use_container_width=True)
+    if sar_path.exists() and sar_path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
+        raw = cv2.imread(str(sar_path), cv2.IMREAD_COLOR)
+        if raw is None:
+            st.warning("Could not decode the SAR output for interactive viewing.")
         else:
-            st.info(f"SAR raster prepared: `{sar_path}`")
+            rgb = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
+            gray = cv2.cvtColor(raw, cv2.COLOR_BGR2GRAY)
+            h, w = gray.shape
+
+            view_mode = st.radio(
+                "View", ["Backscatter intensity", "RGB composite"],
+                horizontal=True, key="sar_view_mode", label_visibility="collapsed",
+            )
+
+            fig_sar = go.Figure()
+            if view_mode == "Backscatter intensity":
+                fig_sar.add_trace(go.Heatmap(
+                    z=gray, colorscale="Cividis", reversescale=True,
+                    colorbar=dict(title="backscatter<br>(0-255)", thickness=10),
+                    hovertemplate="row %{y}, col %{x}<br>intensity: %{z}<extra></extra>",
+                ))
+            else:
+                fig_sar.add_trace(go.Image(z=rgb, hovertemplate="row %{y}, col %{x}<extra></extra>"))
+
+            row_pick = st.slider("Inspect row (px)", 0, h - 1, h // 2, key="sar_row_pick")
+            fig_sar.add_shape(
+                type="line", x0=0, x1=w - 1, y0=row_pick, y1=row_pick,
+                line=dict(color="#45D6FF", width=1.5, dash="dot"),
+            )
+
+            fig_sar.update_yaxes(autorange="reversed", showgrid=False, visible=False)
+            fig_sar.update_xaxes(showgrid=False, visible=False)
+            fig_sar.update_layout(
+                height=340, margin=dict(l=0, r=0, t=5, b=0),
+                paper_bgcolor="#071018", plot_bgcolor="#071018",
+                font=dict(color="#DCE8EE", size=10),
+            )
+            st.plotly_chart(fig_sar, use_container_width=True, config={"displayModeBar": True})
+
+            profile_fig = go.Figure(go.Scatter(
+                y=gray[row_pick, :], mode="lines", line=dict(color="#45D6FF", width=1.5),
+                fill="tozeroy", fillcolor="rgba(69,214,255,0.12)",
+            ))
+            profile_fig.update_layout(
+                height=140, margin=dict(l=30, r=10, t=8, b=20),
+                paper_bgcolor="#071018", plot_bgcolor="#091720",
+                font=dict(color="#8299A6", size=9),
+                xaxis=dict(title="column (px)", gridcolor="#18303A"),
+                yaxis=dict(title="intensity", gridcolor="#18303A", range=[0, 255]),
+            )
+            st.plotly_chart(profile_fig, use_container_width=True, config={"displayModeBar": False})
+            st.caption(
+                f"{spill_source} SAR output · {w}×{h} px · drag to zoom, hover for pixel intensity, "
+                "drag the row slider to trace a backscatter cross-section."
+            )
+    elif sar_path.exists():
+        st.info(f"SAR raster prepared: `{sar_path}`")
     else:
         st.warning("The SAR output file is no longer available.")
 
@@ -1084,31 +1744,38 @@ with report_col:
     st.markdown('<div class="section-title">INVESTIGATION SNAPSHOT</div>', unsafe_allow_html=True)
 
     lead_text = (
-        f"<b>{top_suspect['VesselName']}</b> ranks highest among the loaded AIS observations."
+        f"<b>{top_suspect['VesselName']}</b> ({top_suspect['VesselType']}, MMSI {top_suspect['MMSI']}) "
+        f"ranks highest — {top_suspect['Min_Distance_km']:.2f} km / {top_suspect['Time_Offset_hrs']:.1f} h "
+        f"from the reconstructed origin, risk score {top_suspect['Risk_Score']:.1f}."
         if top_suspect is not None else "No attribution lead was produced."
     )
 
     st.markdown(
         f"""
         <div class="alert">
-            <b>DETECTION</b><br>
-            {spill_source} SAR processing produced the slick detection used by the analysis pipeline.
+            <b>① DETECTION</b><br>
+            {spill_source} SAR processing detected a slick of {spill_data['area_sqkm']:.2f} km²
+            (est. {spill_data['volume_barrels']:,.0f} barrels) at
+            <b>{centroid[0]:.5f}, {centroid[1]:.5f}</b>.
         </div>
         <div class="alert">
-            <b>OBSERVED CENTROID</b><br>
-            {centroid[0]:.5f}, {centroid[1]:.5f}
+            <b>② HINDCAST ORIGIN</b><br>
+            Backward drift modelling (current {current_speed:.2f} m/s @ {current_dir:.0f}°) estimated a
+            probable origin at <b>{origin_point[0]:.5f}, {origin_point[1]:.5f}</b> around
+            {spill_time.strftime('%Y-%m-%d %H:%M UTC')}.
         </div>
         <div class="alert">
-            <b>HINDCAST</b><br>
-            Backward drift modelling estimated a probable origin at
-            <b>{origin_point[0]:.5f}, {origin_point[1]:.5f}</b>.
+            <b>③ FORECAST</b><br>
+            Projected position by {future_time.strftime('%Y-%m-%d %H:%M UTC')}
+            (+{forecast_hours} h): <b>{future_lat:.5f}, {future_lon:.5f}</b>.
         </div>
         <div class="alert">
             <b>AIS CORRELATION</b><br>
-            {len(suspects)} vessels were evaluated using {ais_source} AIS observations.
+            {len(suspects)} vessel(s) evaluated using {ais_source} AIS observations,
+            {candidate_count} within {search_radius} km of the origin.
         </div>
         <div class="alert">
-            <b>LEAD</b><br>
+            <b>④ TOP LEAD</b><br>
             {lead_text}
         </div>
         <div class="alert good">
@@ -1119,17 +1786,18 @@ with report_col:
         unsafe_allow_html=True,
     )
 
-    pdf_bytes = generate_pdf_report(
+    yaml_report_text = generate_yaml_report(
         spill_data, origin_point, spill_time, future_point, future_time,
         current_speed, current_dir, suspects, min_lat, max_lat, min_lon, max_lon,
         forecast_hours, spill_source, ais_source,
+        seep_eval=seep_eval, platform_eval=platform_eval, night_check=night_check,
     )
 
     st.download_button(
-        label="Download Investigation Report (PDF)",
-        data=pdf_bytes,
-        file_name=f"oil_spill_investigation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
-        mime="application/pdf",
+        label="Download Investigation Report (YAML)",
+        data=yaml_report_text,
+        file_name=f"oil_spill_investigation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.yaml",
+        mime="application/x-yaml",
         use_container_width=True,
     )
 
@@ -1169,4 +1837,3 @@ with fleet_chart_col:
         annotations=[dict(text="Fleet mix", showarrow=False, font=dict(color="#8299A6", size=11))],
     )
     st.plotly_chart(fleet_fig, use_container_width=True)
-

@@ -1,13 +1,17 @@
-import math
-import requests
+"""Monte Carlo backward/forward drift reconstruction for a spill centroid,
+combining wind and ocean-current vectors with an empirical wind-drift factor."""
+
 import numpy as np
+import requests
 
 EARTH_RADIUS_M = 6_371_000
+
 
 def meters_to_latlon(dx, dy, latitude):
     dlat = np.degrees(dy / EARTH_RADIUS_M)
     dlon = np.degrees(dx / (EARTH_RADIUS_M * np.cos(np.radians(latitude))))
     return dlat, dlon
+
 
 def vector_from_speed_direction(speed, direction_deg):
     direction_rad = np.radians(direction_deg)
@@ -15,20 +19,24 @@ def vector_from_speed_direction(speed, direction_deg):
     north = speed * np.cos(direction_rad)
     return east, north
 
+
 def fetch_real_ocean_currents(lat, lon):
     try:
         url = f"https://marine-api.open-meteo.com/v1/marine?latitude={lat}&longitude={lon}&hourly=ocean_current_velocity,ocean_current_direction"
         response = requests.get(url, timeout=5)
         response.raise_for_status()
         data = response.json()
-        velocity_kmh = data['hourly']['ocean_current_velocity'][0]
-        direction_deg = data['hourly']['ocean_current_direction'][0]
+        velocity_kmh = data["hourly"]["ocean_current_velocity"][0]
+        direction_deg = data["hourly"]["ocean_current_direction"][0]
         speed_ms = (velocity_kmh * 1000.0) / 3600.0 if velocity_kmh else 0.5
         return speed_ms, direction_deg
     except Exception:
         return 0.5, 210.0
 
-def simulate_drift(centroid, hours, wind_speed_ms=8.0, wind_dir_deg=225.0, current_speed_ms=None, current_dir_deg=None, mode="backward", n_simulations=5000):
+
+def simulate_drift(centroid, hours, wind_speed_ms=8.0, wind_dir_deg=225.0,
+                    current_speed_ms=None, current_dir_deg=None,
+                    mode="backward", n_simulations=5000):
     lat, lon = centroid
     time_seconds = hours * 3600.0
 
