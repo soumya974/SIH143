@@ -69,7 +69,7 @@ from modules.yaml_report import generate_yaml_report
 # ---------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="OILTRACE — Maritime Spill Intelligence",
+    page_title="Sagar Oil Sentinel",
     page_icon="OT",
     layout="wide",
     initial_sidebar_state="expanded",
