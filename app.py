@@ -1449,11 +1449,10 @@ with d1:
     )
 
     yaml_str = generate_yaml_report(
-        spill_data, origin_point, spill_time, future_point, future_time,
-        current_speed, current_dir, suspects, min_lat, max_lat, min_lon, max_lon,
-        forecast_hours, spill_source=spill_source, ais_source=ais_source,
-        seep_eval=seep_eval, platform_eval=platform_eval, night_check=night_check,
-        incident_classification="natural_seep" if is_natural_seep_mode else "anthropogenic_spill",
+    spill_data, origin_point, spill_time, future_point, future_time,
+    current_speed, current_dir, suspects, min_lat, max_lat, min_lon, max_lon,
+    forecast_hours, spill_source, ais_source,
+    seep_eval=seep_eval, platform_eval=platform_eval, night_check=night_check,
     )
     st.download_button(
         label="Download Forensic Investigation Report (YAML)",
