@@ -1,71 +1,62 @@
-"""Ranks AIS vessel tracks by how strongly they implicate the vessel as the
-spill source, based on proximity to the reconstructed origin, time offset
-from the estimated spill time, and anomalously low speed."""
+"""
+AIS vessel attribution and risk scoring engine for OILTRACE.
+Correlates commercial maritime traffic with the reconstructed origin.
+"""
 
-from datetime import datetime
-
+import math
 import numpy as np
 import pandas as pd
 
+EARTH_RADIUS_KM = 6371.0088
 
-def haversine(lat1, lon1, lat2, lon2):
-    R = 6371.0
-    dlat = np.radians(lat2 - lat1)
-    dlon = np.radians(lon2 - lon1)
-    a = np.sin(dlat / 2) ** 2 + np.cos(np.radians(lat1)) * np.cos(np.radians(lat2)) * np.sin(dlon / 2) ** 2
-    return 2 * R * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
-
-
-def _parse_time(value):
-    try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        return None
+def haversine_km(lat1, lon1, lat2, lon2):
+    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
+    return 2.0 * EARTH_RADIUS_KM * np.arcsin(np.sqrt(a))
 
 
 def score_vessels(ais_df, origin_lat, origin_lon, spill_time):
     """
-    Returns a DataFrame with one row per MMSI, ranked by descending Risk_Score:
-    Min_Distance_km, Time_Offset_hrs and Speed_at_CPA are the closest AIS
-    observation to the reconstructed origin, the smallest time gap to the
-    estimated spill time, and the vessel's mean reported speed.
+    Ranks AIS vessel observations based on closest point of approach (CPA) distance,
+    temporal delta to estimated release time, vessel cargo type weight, and speed anomalies.
     """
-    if ais_df.empty:
+    if ais_df is None or ais_df.empty:
         return pd.DataFrame()
 
-    df = ais_df.copy()
-    df["_distance_km"] = haversine(df["LAT"], df["LON"], origin_lat, origin_lon)
+    results = []
+    for mmsi, group in ais_df.groupby("MMSI"):
+        dists = [haversine_km(r["LAT"], r["LON"], origin_lat, origin_lon) for _, r in group.iterrows()]
+        if not dists:
+            continue
+        min_idx = int(np.argmin(dists))
+        min_dist = dists[min_idx]
+        v_name = group["VesselName"].iloc[0]
+        v_type = group["VesselType"].iloc[0]
+        spd_cpa = group["SOG"].iloc[min_idx]
 
-    if "BaseDateTime" in df.columns:
-        parsed = df["BaseDateTime"].map(_parse_time)
-        df["_time_offset_hrs"] = parsed.map(
-            lambda t: abs((t - spill_time).total_seconds() / 3600.0) if t is not None else 1.0
-        )
-    else:
-        df["_time_offset_hrs"] = 1.0
+        t_cpa = pd.to_datetime(group["BaseDateTime"].iloc[min_idx], utc=True)
+        time_offset_hrs = abs((t_cpa - spill_time).total_seconds()) / 3600.0
 
-    if "SOG" not in df.columns:
-        df["SOG"] = 10.0
+        # Weighted heuristic formula
+        type_weight = 1.35 if "Tanker" in str(v_type) else (1.0 if "Container" in str(v_type) else 0.8)
+        spd_anomaly = 1.45 if spd_cpa < 6.0 else 0.9
 
-    records = []
-    for mmsi, group in df.groupby("MMSI"):
-        min_dist = float(group["_distance_km"].min())
-        min_time = float(group["_time_offset_hrs"].min())
-        avg_speed = float(group["SOG"].mean())
+        prox_score = max(0.0, 100.0 - (min_dist * 6.5) - (time_offset_hrs * 2.5))
+        risk = min(98.5, prox_score * type_weight * spd_anomaly * 0.72)
 
-        risk_score = max(0.0, 100.0 - (min_dist * 3.0) - (min_time * 2.0) + (max(0.0, 12.0 - avg_speed) * 2.0))
-
-        records.append({
-            "MMSI": mmsi,
-            "VesselName": group["VesselName"].iloc[0] if "VesselName" in group.columns else f"Vessel_{mmsi}",
-            "VesselType": group["VesselType"].iloc[0] if "VesselType" in group.columns else "Tanker",
-            "Min_Distance_km": round(min_dist, 2),
-            "Time_Offset_hrs": round(min_time, 1),
-            "Speed_at_CPA": round(avg_speed, 1),
-            "Risk_Score": round(risk_score, 1),
+        results.append({
+            "MMSI": int(mmsi),
+            "VesselName": str(v_name),
+            "VesselType": str(v_type),
+            "Min_Distance_km": round(float(min_dist), 2),
+            "Time_Offset_hrs": round(float(time_offset_hrs), 1),
+            "Speed_at_CPA": round(float(spd_cpa), 1),
+            "Risk_Score": round(float(risk), 1),
         })
 
-    result = pd.DataFrame(records)
-    if not result.empty:
-        result = result.sort_values(by="Risk_Score", ascending=False).reset_index(drop=True)
-    return result
+    if not results:
+        return pd.DataFrame()
+
+    return pd.DataFrame(results).sort_values("Risk_Score", ascending=False).reset_index(drop=True)
