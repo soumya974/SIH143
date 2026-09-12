@@ -1,7 +1,6 @@
 """
 Natural-source and infrastructure screening for OILTRACE.
-Screens reconstructed origins against the comprehensive 26-site natural seep and 28-site offshore platform databases.
-Supports both proximity radius matching and geographic bounding-box containment.
+Screens reconstructed origins against the 26-site natural seep and 28-site offshore platform registries.
 """
 
 import math
@@ -10,6 +9,7 @@ import pandas as pd
 from modules.real_datasets import KNOWN_NATURAL_SEEPS, KNOWN_OFFSHORE_PLATFORMS
 
 EARTH_RADIUS_KM = 6371.0088
+
 
 def haversine_km(lat1, lon1, lat2, lon2):
     lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
@@ -20,17 +20,13 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 
 def evaluate_natural_seeps(origin_lat, origin_lon, search_radius_km, bbox=None):
-    """
-    Checks reconstructed origin coordinates and bounding box against all 26 registered natural cold seeps.
-    Flags as positive if within search_radius_km OR contained directly inside the bounding box.
-    """
     records = []
     nearest = None
     seep_in_bbox = None
 
     for site in KNOWN_NATURAL_SEEPS:
         dist_km = float(haversine_km(origin_lat, origin_lon, site["lat"], site["lon"]))
-        
+
         inside_bbox = False
         if bbox is not None:
             b_min_lat, b_max_lat, b_min_lon, b_max_lon = bbox
@@ -72,15 +68,14 @@ def evaluate_natural_seeps(origin_lat, origin_lon, search_radius_km, bbox=None):
                 "inside_bbox": inside_bbox,
             }
 
-    # Prioritize seep inside the user's bounding box
     chosen_seep = seep_in_bbox or nearest
     is_flagged = bool((seep_in_bbox is not None) or (nearest and nearest["dist_km"] <= search_radius_km))
     table = pd.DataFrame(records).sort_values("Distance (km)").reset_index(drop=True) if records else pd.DataFrame()
 
     if seep_in_bbox:
-        label = f"Documented seep '{chosen_seep['name']}' ({chosen_seep['depth_m']}m depth) is directly inside the incident area ({chosen_seep['dist_km']:.2f} km from origin) — confirmed natural geogenic seep."
+        label = f"Documented seep '{chosen_seep['name']}' ({chosen_seep['depth_m']}m depth) is directly inside the incident area ({chosen_seep['dist_km']:.2f} km from origin)."
     elif is_flagged:
-        label = f"{chosen_seep['dist_km']:.2f} km from documented seep '{chosen_seep['name']}' ({chosen_seep['depth_m']}m depth) — confirmed natural geogenic seep."
+        label = f"{chosen_seep['dist_km']:.2f} km from documented seep '{chosen_seep['name']}' ({chosen_seep['depth_m']}m depth) — confirmed natural seep."
     elif chosen_seep:
         label = f"No documented seep within {search_radius_km} km (nearest: {chosen_seep['name']}, {chosen_seep['dist_km']:.1f} km away)."
     else:
@@ -90,17 +85,13 @@ def evaluate_natural_seeps(origin_lat, origin_lon, search_radius_km, bbox=None):
 
 
 def evaluate_offshore_platforms(origin_lat, origin_lon, search_radius_km, bbox=None):
-    """
-    Checks reconstructed origin coordinates and bounding box against all 28 registered offshore platforms.
-    Flags as positive if within search_radius_km OR contained directly inside the bounding box.
-    """
     records = []
     nearest = None
     rig_in_bbox = None
 
     for rig in KNOWN_OFFSHORE_PLATFORMS:
         dist_km = float(haversine_km(origin_lat, origin_lon, rig["latitude"], rig["longitude"]))
-        
+
         inside_bbox = False
         if bbox is not None:
             b_min_lat, b_max_lat, b_min_lon, b_max_lon = bbox
@@ -147,9 +138,9 @@ def evaluate_offshore_platforms(origin_lat, origin_lon, search_radius_km, bbox=N
     table = pd.DataFrame(records).sort_values("Distance (km)").reset_index(drop=True) if records else pd.DataFrame()
 
     if rig_in_bbox:
-        label = f"'{chosen_rig['name']}' ({chosen_rig['operator']}) is inside incident area ({chosen_rig['dist_km']:.2f} km from origin) — check platform riser/pipeline integrity."
+        label = f"'{chosen_rig['name']}' ({chosen_rig['operator']}) is inside incident area ({chosen_rig['dist_km']:.2f} km from origin) — check facility integrity."
     elif is_flagged:
-        label = f"'{chosen_rig['name']}' ({chosen_rig['operator']}) is {chosen_rig['dist_km']:.2f} km from origin — check platform riser/pipeline integrity."
+        label = f"'{chosen_rig['name']}' ({chosen_rig['operator']}) is {chosen_rig['dist_km']:.2f} km from origin — check facility integrity."
     elif chosen_rig:
         label = f"No platform within {search_radius_km} km (nearest: {chosen_rig['name']}, {chosen_rig['dist_km']:.1f} km away)."
     else:
@@ -189,7 +180,7 @@ def assess_night_discharge(spill_time_utc, lat, lon):
     is_dark = ((spill_h - sunrise_h) % 24) > daylight_span
 
     if is_dark:
-        label = f"Nautical darkness at estimated release time (~{spill_time_utc.strftime('%H:%M')} UTC) — nocturnal dump window."
+        label = f"Nautical darkness at estimated release time (~{spill_time_utc.strftime('%H:%M')} UTC)."
     else:
         label = f"Estimated release occurred during daylight (~{spill_time_utc.strftime('%H:%M')} UTC)."
     return {"flag": is_dark, "label": label}
