@@ -771,8 +771,8 @@ spill_time = now_utc - timedelta(hours=age_hours)
 future_time = now_utc + timedelta(hours=forecast_hours)
 
 bbox = (min_lat, max_lat, min_lon, max_lon)
-seep_eval = evaluate_natural_seeps(origin_point[0], origin_point[1], search_radius, bbox=bbox)
-platform_eval = evaluate_offshore_platforms(origin_point[0], origin_point[1], search_radius, bbox=bbox)
+seep_eval = evaluate_natural_seeps(origin_point[0], origin_point[1], search_radius)
+platform_eval = evaluate_offshore_platforms(origin_point[0], origin_point[1], search_radius)
 night_check = assess_night_discharge(spill_time, origin_point[0], origin_point[1])
 
 suspects = score_vessels(ais, origin_point[0], origin_point[1], spill_time)
