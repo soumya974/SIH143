@@ -759,8 +759,21 @@ centroid = spill_data["centroid"]
 age_hours = float(spill_data.get("estimated_age_hours", 12.0))
 
 current_speed, current_dir = fetch_real_ocean_currents(centroid[0], centroid[1])
-hindcast_path, origin_point = simulate_drift(centroid, age_hours, mode="backward", current_speed=current_speed, current_dir=current_dir)
-forecast_path, future_point = simulate_drift(centroid, forecast_hours, mode="forward", current_speed=current_speed, current_dir=current_dir)
+hindcast_path, origin_point = simulate_drift(
+    centroid,
+    age_hours,
+    mode="backward",
+    current_speed_ms=current_speed,
+    current_dir_deg=current_dir,
+)
+
+forecast_path, future_point = simulate_drift(
+    centroid,
+    forecast_hours,
+    mode="forward",
+    current_speed_ms=current_speed,
+    current_dir_deg=current_dir,
+)
 
 now_utc = datetime.now(timezone.utc)
 spill_time = now_utc - timedelta(hours=age_hours)
