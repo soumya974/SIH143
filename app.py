@@ -69,7 +69,7 @@ from modules.pdf_report import generate_reliable_pdf_report
 # ---------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="Sagar Oil Sentinel",
+    page_title="OILTRACE — Maritime Spill Intelligence",
     page_icon="OT",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -567,7 +567,12 @@ with st.sidebar:
         st.session_state.case_mode_selection = "Natural Geological Seep (Geogenic Seafloor Vent)"
         st.session_state.selected_preset = "bush_hill"
         st.session_state.pipeline_run = False
-        st.session_state.data_status_msg = None
+        generate_dynamic_dataset(27.200, 28.300, -91.800, -90.700)
+        st.session_state.data_ready = True
+        st.session_state.data_status_msg = {
+            "type": "success",
+            "text": "Bush Hill preset generated. Click 'Run Pipeline' below."
+        }
         st.rerun()
 
     is_gc = st.session_state.selected_preset == "gc600"
@@ -577,7 +582,12 @@ with st.sidebar:
         st.session_state.case_mode_selection = "Natural Geological Seep (Geogenic Seafloor Vent)"
         st.session_state.selected_preset = "gc600"
         st.session_state.pipeline_run = False
-        st.session_state.data_status_msg = None
+        generate_dynamic_dataset(26.800, 27.700, -90.800, -89.700)
+        st.session_state.data_ready = True
+        st.session_state.data_status_msg = {
+            "type": "success",
+            "text": "GC600 preset generated. Click 'Run Pipeline' below."
+        }
         st.rerun()
 
     col_p3, col_p4 = st.columns(2)
@@ -588,7 +598,12 @@ with st.sidebar:
         st.session_state.case_mode_selection = "Natural Geological Seep (Geogenic Seafloor Vent)"
         st.session_state.selected_preset = "coal_oil"
         st.session_state.pipeline_run = False
-        st.session_state.data_status_msg = None
+        generate_dynamic_dataset(34.100, 34.600, -120.200, -119.500)
+        st.session_state.data_ready = True
+        st.session_state.data_status_msg = {
+            "type": "success",
+            "text": "Coal Oil Point preset generated. Click 'Run Pipeline' below."
+        }
         st.rerun()
 
     is_cantarell = st.session_state.selected_preset == "cantarell"
@@ -598,7 +613,12 @@ with st.sidebar:
         st.session_state.case_mode_selection = "Natural Geological Seep (Geogenic Seafloor Vent)"
         st.session_state.selected_preset = "cantarell"
         st.session_state.pipeline_run = False
-        st.session_state.data_status_msg = None
+        generate_dynamic_dataset(19.000, 19.900, -92.800, -91.800)
+        st.session_state.data_ready = True
+        st.session_state.data_status_msg = {
+            "type": "success",
+            "text": "Cantarell preset generated. Click 'Run Pipeline' below."
+        }
         st.rerun()
 
     c1, c2 = st.columns(2)
@@ -719,7 +739,7 @@ with st.sidebar:
 
     st.divider()
     if st.button("Run Pipeline", type="primary", use_container_width=True):
-        if not st.session_state.get("data_ready", False) and (not Path(st.session_state.sar_file).exists() or not AIS_FILE.exists()):
+        if not st.session_state.get("data_ready", False):
             generate_dynamic_dataset(min_lat, max_lat, min_lon, max_lon)
             st.session_state.data_ready = True
         st.session_state.pipeline_run = True
@@ -733,7 +753,10 @@ with st.sidebar:
 st.markdown(
     """
 <div class="hero">
-    <div class="hero-title">Sagar Oil Sentinel</div>
+    <div class="hero-title">OILTRACE <span style="color:#45D6FF">/</span> MARITIME SPILL INTELLIGENCE</div>
+    <div style="color:#9FB2BE; font-size:13px; margin-top:4px;">
+        Forensic Command Console - Multi-Site Seep Screening - 3D Seabed-to-Surface Water Column Modeling - Differential Vessel Attribution
+    </div>
 </div>
 """,
     unsafe_allow_html=True,
@@ -748,17 +771,14 @@ if not st.session_state.pipeline_run:
 # DASHBOARD CALCULATIONS & METOCEAN MODELING
 # ---------------------------------------------------------------------
 
-if not Path(st.session_state.sar_file).exists() or not AIS_FILE.exists():
-    generate_dynamic_dataset(min_lat, max_lat, min_lon, max_lon)
-
-ais = load_ais_data()
 sar_file = st.session_state.sar_file
-
 spill_data = detect_spill(sar_file)
 centroid = spill_data["centroid"]
 age_hours = float(spill_data.get("estimated_age_hours", 12.0))
 
 current_speed, current_dir = fetch_real_ocean_currents(centroid[0], centroid[1])
+
+# Use keyword arguments compatible with trajectory.py
 hindcast_path, origin_point = simulate_drift(
     centroid, age_hours, mode="backward", current_speed_ms=current_speed, current_dir_deg=current_dir
 )
@@ -771,10 +791,18 @@ spill_time = now_utc - timedelta(hours=age_hours)
 future_time = now_utc + timedelta(hours=forecast_hours)
 
 bbox = (min_lat, max_lat, min_lon, max_lon)
-seep_eval = evaluate_natural_seeps(origin_point[0], origin_point[1], search_radius)
-platform_eval = evaluate_offshore_platforms(origin_point[0], origin_point[1], search_radius)
+
+# Safe invocation supporting both 3-arg and 4-arg geo_screening.py
+try:
+    seep_eval = evaluate_natural_seeps(origin_point[0], origin_point[1], search_radius, bbox=bbox)
+    platform_eval = evaluate_offshore_platforms(origin_point[0], origin_point[1], search_radius, bbox=bbox)
+except TypeError:
+    seep_eval = evaluate_natural_seeps(origin_point[0], origin_point[1], search_radius)
+    platform_eval = evaluate_offshore_platforms(origin_point[0], origin_point[1], search_radius)
+
 night_check = assess_night_discharge(spill_time, origin_point[0], origin_point[1])
 
+ais = load_ais_data()
 suspects = score_vessels(ais, origin_point[0], origin_point[1], spill_time)
 top_suspect = suspects.iloc[0] if not suspects.empty else None
 suspect_mmsi = top_suspect["MMSI"] if top_suspect is not None else None
@@ -1189,10 +1217,10 @@ else:
     if top_suspect is not None:
         st.markdown("#### Kinematic Forensic Evidence Dossier - Top Suspect")
         suspect_track = ais[ais["MMSI"] == top_suspect["MMSI"]].sort_values("BaseDateTime").copy()
-        
+
         if not suspect_track.empty:
             suspect_track["Distance_to_Origin_km"] = [
-                haversine_km(r["LAT"], r["LON"], origin_point[0], origin_point[1]) 
+                haversine_km(r["LAT"], r["LON"], origin_point[0], origin_point[1])
                 for _, r in suspect_track.iterrows()
             ]
             cpa_idx = int(suspect_track["Distance_to_Origin_km"].argmin())
@@ -1214,8 +1242,8 @@ else:
 
             # Synchronized kinematic multi-plot
             fig_spd = make_subplots(
-                rows=2, cols=1, 
-                shared_xaxes=True, 
+                rows=2, cols=1,
+                shared_xaxes=True,
                 vertical_spacing=0.08,
                 subplot_titles=(
                     f"Speed Over Ground Profile (Knots) - {top_suspect['VesselName']}",
@@ -1226,94 +1254,94 @@ else:
             # Row 1: Speed over time
             fig_spd.add_trace(
                 go.Scatter(
-                    x=suspect_track["BaseDateTime"], 
-                    y=suspect_track["SOG"], 
-                    mode="lines+markers", 
+                    x=suspect_track["BaseDateTime"],
+                    y=suspect_track["SOG"],
+                    mode="lines+markers",
                     name="Speed (SOG)",
                     line=dict(color="#FFB000", width=2.5),
                     marker=dict(size=4)
-                ), 
+                ),
                 row=1, col=1
             )
             fig_spd.add_hline(
-                y=median_spd, 
-                line_dash="dot", 
-                line_color="#8299A6", 
-                annotation_text=f"Median Cruise Speed ({median_spd:.1f} kt)", 
+                y=median_spd,
+                line_dash="dot",
+                line_color="#8299A6",
+                annotation_text=f"Median Cruise Speed ({median_spd:.1f} kt)",
                 row=1, col=1
             )
             fig_spd.add_trace(
                 go.Scatter(
-                    x=[cpa_time], 
-                    y=[cpa_spd], 
-                    mode="markers+text", 
+                    x=[cpa_time],
+                    y=[cpa_spd],
+                    mode="markers+text",
                     name="Speed at CPA",
                     marker=dict(color="#FF4D5A", size=11, symbol="diamond"),
-                    text=[f"CPA: {cpa_spd:.1f} kt"], 
+                    text=[f"CPA: {cpa_spd:.1f} kt"],
                     textposition="top center"
-                ), 
+                ),
                 row=1, col=1
             )
 
             # Row 2: Distance from spill origin over time
             fig_spd.add_trace(
                 go.Scatter(
-                    x=suspect_track["BaseDateTime"], 
-                    y=suspect_track["Distance_to_Origin_km"], 
-                    mode="lines+markers", 
+                    x=suspect_track["BaseDateTime"],
+                    y=suspect_track["Distance_to_Origin_km"],
+                    mode="lines+markers",
                     name="Distance to Origin",
                     line=dict(color="#45D6FF", width=2.5),
                     marker=dict(size=4)
-                ), 
+                ),
                 row=2, col=1
             )
             fig_spd.add_hline(
-                y=search_radius, 
-                line_dash="dot", 
-                line_color="#38BDF8", 
-                annotation_text=f"Screening Search Radius ({search_radius} km)", 
+                y=search_radius,
+                line_dash="dot",
+                line_color="#38BDF8",
+                annotation_text=f"Screening Search Radius ({search_radius} km)",
                 row=2, col=1
             )
             fig_spd.add_trace(
                 go.Scatter(
-                    x=[cpa_time], 
-                    y=[cpa_dist], 
-                    mode="markers+text", 
+                    x=[cpa_time],
+                    y=[cpa_dist],
+                    mode="markers+text",
                     name="CPA Distance",
                     marker=dict(color="#FF4D5A", size=11, symbol="star"),
-                    text=[f"Min Dist: {cpa_dist:.2f} km"], 
+                    text=[f"Min Dist: {cpa_dist:.2f} km"],
                     textposition="bottom center"
-                ), 
+                ),
                 row=2, col=1
             )
 
             # Highlight estimated release time window
             fig_spd.add_vrect(
-                x0=spill_time - timedelta(hours=1), 
+                x0=spill_time - timedelta(hours=1),
                 x1=spill_time + timedelta(hours=1),
-                fillcolor="rgba(255, 77, 90, 0.12)", 
-                layer="below", 
+                fillcolor="rgba(255, 77, 90, 0.12)",
+                layer="below",
                 line_width=1,
                 line_color="rgba(255, 77, 90, 0.4)",
-                annotation_text="Spill Window", 
+                annotation_text="Spill Window",
                 annotation_position="top left",
                 row=1, col=1
             )
             fig_spd.add_vrect(
-                x0=spill_time - timedelta(hours=1), 
+                x0=spill_time - timedelta(hours=1),
                 x1=spill_time + timedelta(hours=1),
-                fillcolor="rgba(255, 77, 90, 0.12)", 
-                layer="below", 
+                fillcolor="rgba(255, 77, 90, 0.12)",
+                layer="below",
                 line_width=1,
                 line_color="rgba(255, 77, 90, 0.4)",
                 row=2, col=1
             )
 
             fig_spd.update_layout(
-                height=420, 
-                margin=dict(l=10, r=10, t=32, b=10), 
-                paper_bgcolor="#071018", 
-                plot_bgcolor="#091720", 
+                height=420,
+                margin=dict(l=10, r=10, t=32, b=10),
+                paper_bgcolor="#071018",
+                plot_bgcolor="#091720",
                 font=dict(color="#DCE8EE", size=10),
                 showlegend=False
             )
@@ -1448,12 +1476,22 @@ with d1:
         use_container_width=True,
     )
 
-    yaml_str = generate_yaml_report(
-    spill_data, origin_point, spill_time, future_point, future_time,
-    current_speed, current_dir, suspects, min_lat, max_lat, min_lon, max_lon,
-    forecast_hours, spill_source, ais_source,
-    seep_eval=seep_eval, platform_eval=platform_eval, night_check=night_check,
-    )
+    try:
+        yaml_str = generate_yaml_report(
+            spill_data, origin_point, spill_time, future_point, future_time,
+            current_speed, current_dir, suspects, min_lat, max_lat, min_lon, max_lon,
+            forecast_hours, spill_source, ais_source,
+            seep_eval=seep_eval, platform_eval=platform_eval, night_check=night_check,
+        )
+    except TypeError:
+        yaml_str = generate_yaml_report(
+            spill_data, origin_point, spill_time, future_point, future_time,
+            current_speed, current_dir, suspects, min_lat, max_lat, min_lon, max_lon,
+            forecast_hours, spill_source=spill_source, ais_source=ais_source,
+            seep_eval=seep_eval, platform_eval=platform_eval, night_check=night_check,
+            incident_classification="natural_seep" if is_natural_seep_mode else "anthropogenic_spill",
+        )
+
     st.download_button(
         label="Download Forensic Investigation Report (YAML)",
         data=yaml_str,
