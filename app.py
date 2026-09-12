@@ -561,64 +561,52 @@ with st.sidebar:
     st.caption("Quick Coordinate Presets:")
     col_p1, col_p2 = st.columns(2)
     is_bush = st.session_state.selected_preset == "bush_hill"
-    if col_p1.button("Bush Hill", type="primary" if is_bush else "secondary", use_container_width=True, help="Green Canyon 185, GoM (-540m depth)"):
+    if col_p1.button("Bush Hill", type="primary" if is_bush else "secondary", use_container_width=True):
         st.session_state.min_lat, st.session_state.max_lat = 27.200, 28.300
         st.session_state.min_lon, st.session_state.max_lon = -91.800, -90.700
         st.session_state.case_mode_selection = "Natural Geological Seep (Geogenic Seafloor Vent)"
         st.session_state.selected_preset = "bush_hill"
-        st.session_state.pipeline_run = False
         generate_dynamic_dataset(27.200, 28.300, -91.800, -90.700)
         st.session_state.data_ready = True
-        st.session_state.data_status_msg = {
-            "type": "success",
-            "text": "Bush Hill preset generated. Click 'Run Pipeline' below."
-        }
+        st.session_state.pipeline_run = False
+        st.session_state.data_status_msg = {"type": "success", "text": "Bush Hill dataset generated. Click 'Run Pipeline'."}
         st.rerun()
 
     is_gc = st.session_state.selected_preset == "gc600"
-    if col_p2.button("GC600 Seep", type="primary" if is_gc else "secondary", use_container_width=True, help="Green Canyon 600, GoM (-1200m depth)"):
+    if col_p2.button("GC600 Seep", type="primary" if is_gc else "secondary", use_container_width=True):
         st.session_state.min_lat, st.session_state.max_lat = 26.800, 27.700
         st.session_state.min_lon, st.session_state.max_lon = -90.800, -89.700
         st.session_state.case_mode_selection = "Natural Geological Seep (Geogenic Seafloor Vent)"
         st.session_state.selected_preset = "gc600"
-        st.session_state.pipeline_run = False
         generate_dynamic_dataset(26.800, 27.700, -90.800, -89.700)
         st.session_state.data_ready = True
-        st.session_state.data_status_msg = {
-            "type": "success",
-            "text": "GC600 preset generated. Click 'Run Pipeline' below."
-        }
+        st.session_state.pipeline_run = False
+        st.session_state.data_status_msg = {"type": "success", "text": "GC600 Mega Plume dataset generated. Click 'Run Pipeline'."}
         st.rerun()
 
     col_p3, col_p4 = st.columns(2)
     is_coal = st.session_state.selected_preset == "coal_oil"
-    if col_p3.button("Coal Oil Pt", type="primary" if is_coal else "secondary", use_container_width=True, help="Santa Barbara, CA (-65m depth)"):
+    if col_p3.button("Coal Oil Pt", type="primary" if is_coal else "secondary", use_container_width=True):
         st.session_state.min_lat, st.session_state.max_lat = 34.100, 34.600
         st.session_state.min_lon, st.session_state.max_lon = -120.200, -119.500
         st.session_state.case_mode_selection = "Natural Geological Seep (Geogenic Seafloor Vent)"
         st.session_state.selected_preset = "coal_oil"
-        st.session_state.pipeline_run = False
         generate_dynamic_dataset(34.100, 34.600, -120.200, -119.500)
         st.session_state.data_ready = True
-        st.session_state.data_status_msg = {
-            "type": "success",
-            "text": "Coal Oil Point preset generated. Click 'Run Pipeline' below."
-        }
+        st.session_state.pipeline_run = False
+        st.session_state.data_status_msg = {"type": "success", "text": "Coal Oil Point dataset generated. Click 'Run Pipeline'."}
         st.rerun()
 
     is_cantarell = st.session_state.selected_preset == "cantarell"
-    if col_p4.button("Cantarell", type="primary" if is_cantarell else "secondary", use_container_width=True, help="Campeche, Mexico (-45m depth)"):
+    if col_p4.button("Cantarell", type="primary" if is_cantarell else "secondary", use_container_width=True):
         st.session_state.min_lat, st.session_state.max_lat = 19.000, 19.900
         st.session_state.min_lon, st.session_state.max_lon = -92.800, -91.800
         st.session_state.case_mode_selection = "Natural Geological Seep (Geogenic Seafloor Vent)"
         st.session_state.selected_preset = "cantarell"
-        st.session_state.pipeline_run = False
         generate_dynamic_dataset(19.000, 19.900, -92.800, -91.800)
         st.session_state.data_ready = True
-        st.session_state.data_status_msg = {
-            "type": "success",
-            "text": "Cantarell preset generated. Click 'Run Pipeline' below."
-        }
+        st.session_state.pipeline_run = False
+        st.session_state.data_status_msg = {"type": "success", "text": "Cantarell Complex dataset generated. Click 'Run Pipeline'."}
         st.rerun()
 
     c1, c2 = st.columns(2)
