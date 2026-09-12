@@ -69,7 +69,7 @@ from modules.pdf_report import generate_reliable_pdf_report
 # ---------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="OILTRACE — Maritime Spill Intelligence",
+    page_title="Sagar Oil Sentinel",
     page_icon="OT",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -741,10 +741,7 @@ with st.sidebar:
 st.markdown(
     """
 <div class="hero">
-    <div class="hero-title">OILTRACE <span style="color:#45D6FF">/</span> MARITIME SPILL INTELLIGENCE</div>
-    <div style="color:#9FB2BE; font-size:13px; margin-top:4px;">
-        Forensic Command Console - Multi-Site Seep Screening - 3D Seabed-to-Surface Water Column Modeling - Differential Vessel Attribution
-    </div>
+    <div class="hero-title">Sagar Oil Sentinel</div>
 </div>
 """,
     unsafe_allow_html=True,
